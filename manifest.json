@@ -1,0 +1,8 @@
+{
+    "display_name": "Sustained Chat",
+    "plugin_id": "sustained-chat",
+    "version": "1.0.1",
+    "author": "KiraAI+znq19",
+    "description": "基于原版 Default Chat 优化非唤醒消息识别和增加持续回复功能：AI 回复后，在设定时间内收到非唤醒消息可按概率再次回复。",
+    "repo": null
+}

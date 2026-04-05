@@ -1,0 +1,81 @@
+{
+  "waking_words": {
+    "name": "Waking words",
+    "type": "list",
+    "default": [],
+    "hint": "Mark as mentioned if any of the words appeared in the message"
+  },
+  "receive_unmentioned": {
+    "name": "Receive Unmentioned Messages",
+    "type": "switch",
+    "default": true,
+    "hint": "Receive unmentioned messages as context"
+  },
+  "max_unmentioned_messages": {
+    "name": "Max Unmentioned Messages",
+    "type": "integer",
+    "default": 3,
+    "hint": "Max unmentioned message count to be added to buffer as context"
+  },
+  "group_chat_prompt": {
+    "name": "Group Chat Prompt",
+    "type": "markdown",
+    "default": "",
+    "hint": "Extra prompt for AI to better behave in group chat"
+  },
+  "image_recognition_only_on_mention": {
+    "name": "仅唤醒消息识图",
+    "type": "boolean",
+    "default": true,
+    "hint": "为true时，只有唤醒消息（@或唤醒词）中的图片/动画表情会保留（识别）；非唤醒消息中的全部替换为文本。为false时，所有消息中的图片/表情按概率和数量处理。"
+  },
+  "image_recognition_probability": {
+    "name": "识图概率",
+    "type": "number",
+    "default": 0.5,
+    "minimum": 0,
+    "maximum": 1,
+    "hint": "非唤醒消息中图片/表情被保留的概率（仅在image_recognition_only_on_mention=false时生效）。"
+  },
+  "max_images_per_message": {
+    "name": "最多保留图片/表情数",
+    "type": "integer",
+    "default": 3,
+    "minimum": 0,
+    "hint": "每条消息最多保留的图片+动画表情数量（超出部分替换为文本）。仅在image_recognition_only_on_mention=false时生效。"
+  },
+  "forward_recognition_only_on_mention": {
+    "name": "仅唤醒消息解析转发",
+    "type": "boolean",
+    "default": true,
+    "hint": "为true时，只有唤醒消息中的合并转发消息会被展开显示详细内容；非唤醒消息中的转发消息替换为[转发消息]。为false时，所有转发消息都展开（注意：可能消耗较多token）。"
+  },
+  "sustain_window_seconds": {
+    "name": "持续回复窗口（秒）",
+    "type": "number",
+    "default": 60,
+    "minimum": 0,
+    "hint": "AI 每次回复后，在此时间内收到的非唤醒消息有机会触发再次回复。设为 0 表示无窗口（总是可触发）。"
+  },
+  "reply_probability": {
+    "name": "持续回复概率",
+    "type": "number",
+    "default": 0.8,
+    "minimum": 0,
+    "maximum": 1,
+    "hint": "在窗口内收到非唤醒消息时，触发再次回复的概率。"
+  },
+  "max_continuous_replies": {
+    "name": "最大再次回复次数",
+    "type": "integer",
+    "default": -1,
+    "minimum": -1,
+    "hint": "一次唤醒后最多再次回复的次数（-1 表示无限）。"
+  },
+  "stop_on_empty_message": {
+    "name": "空消息自动停止持续回复",
+    "type": "boolean",
+    "default": true,
+    "hint": "当 AI 输出仅包含空消息（如 <msg/>）时，自动清除持续回复窗口和计数，停止后续持续回复（直到下次唤醒）。"
+  }
+}
