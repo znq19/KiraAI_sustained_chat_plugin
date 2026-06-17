@@ -1,5 +1,5 @@
 
-# KiraAI_sustained_chat_plugin/可持续聊天 — 让 AI 真正“活”起来
+# KiraAI_sustained_chat_plugin/可持续聊天 — 让 AI 真“主动”起来
 
 > 这不是一个普通的聊天优化插件，而是一套完整的“社交主动性引擎”。
 
