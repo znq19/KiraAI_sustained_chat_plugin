@@ -570,7 +570,8 @@ class DebouncePlugin(BasePlugin):
     async def handle_msg(self, event: KiraMessageEvent):
         # --- 修复：过滤机器人自己的私聊消息 ---
         if not event.is_group_message():
-            self_id = str(event.self_id) if event.self_id is not None else None
+            # 正确获取 self_id
+            self_id = str(event.message.self_id) if hasattr(event.message, 'self_id') and event.message.self_id is not None else None
             sender_id = str(event.message.sender.user_id) if event.message.sender else None
             if self_id and sender_id and self_id == sender_id:
                 logger.debug(f"[Debounce] 忽略机器人自己的私聊消息: {event.message.message_id}")
