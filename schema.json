@@ -1,137 +1,366 @@
 {
-  "waking_words": {
-    "name": "Waking words",
-    "type": "list",
-    "default": [],
-    "hint": "Mark as mentioned if any of the words appeared in the message"
+  "section_basic": {
+    "type": "section",
+    "name": "基础设置",
+    "collapsed": false,
+    "fields": {
+      "waking_words": {
+        "name": "唤醒词",
+        "type": "list",
+        "default": [],
+        "hint": "消息中包含这些词时视为被提及（即使未被@）"
+      },
+      "receive_unmentioned": {
+        "name": "接收非唤醒消息",
+        "type": "switch",
+        "default": true,
+        "hint": "是否将非唤醒消息也加入上下文（用于持续对话）"
+      },
+      "max_unmentioned_messages": {
+        "name": "最大非唤醒消息数",
+        "type": "integer",
+        "default": 5,
+        "minimum": 1,
+        "hint": "缓冲区中最多保留多少条非唤醒消息作为上下文"
+      },
+      "group_chat_prompt": {
+        "name": "群聊额外提示词",
+        "type": "markdown",
+        "default": "### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[动画表情]或[图片]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n",
+        "hint": "注入到 system prompt 中，用于指导 AI 在群聊中的行为"
+      },
+      "group_proactive_chat": {
+        "name": "群聊主动发言",
+        "type": "switch",
+        "default": false,
+        "hint": "允许 AI 在群聊中主动发送消息（需同时启用接收非唤醒消息）"
+      },
+      "group_proactive_chat_probability": {
+        "name": "群聊主动发言概率",
+        "type": "number",
+        "default": 0.1,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "每条非唤醒消息触发主动发言的概率"
+      }
+    }
   },
-  "receive_unmentioned": {
-    "name": "Receive Unmentioned Messages",
-    "type": "switch",
-    "default": true,
-    "hint": "Receive unmentioned messages as context"
+
+  "section_media": {
+    "type": "section",
+    "name": "消息处理（图片/语音/转发）",
+    "collapsed": true,
+    "fields": {
+      "image_recognition_only_on_mention": {
+        "name": "仅唤醒消息识图",
+        "type": "switch",
+        "default": true,
+        "hint": "为 true 时，只有唤醒消息中的图片/动画表情会保留（识别）；非唤醒消息中的全部替换为 [图片]。为 false 时，按概率和数量处理。"
+      },
+      "image_recognition_probability": {
+        "name": "识图概率",
+        "type": "number",
+        "default": 0.5,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "非唤醒消息中图片/表情被保留的概率（仅在 image_recognition_only_on_mention=false 时生效）"
+      },
+      "max_images_per_message": {
+        "name": "最多保留图片/表情数",
+        "type": "integer",
+        "default": 3,
+        "minimum": 0,
+        "hint": "每条消息最多保留的图片+动画表情数量（超出部分替换为 [图片]）。仅在 image_recognition_only_on_mention=false 时生效"
+      },
+      "forward_recognition_only_on_mention": {
+        "name": "仅唤醒消息解析转发",
+        "type": "switch",
+        "default": true,
+        "hint": "为 true 时，只有唤醒消息中的合并转发消息会被展开显示详细内容；非唤醒消息中的转发消息替换为 [转发消息]。为 false 时，所有转发消息都展开（注意：可能消耗较多 token）。"
+      },
+      "voice_recognition_only_on_mention": {
+        "name": "仅唤醒消息识别语音（群聊）",
+        "type": "switch",
+        "default": true,
+        "hint": "为 true 时，只有唤醒消息中的语音会尝试识别；非唤醒消息中的语音替换为 [语音]。"
+      },
+      "voice_private_need_mention": {
+        "name": "私聊需要引用才识别语音",
+        "type": "switch",
+        "default": true,
+        "hint": "为 true 时，私聊中只有引用机器人（回复）的语音才尝试识别；为 false 时，私聊中所有语音都尝试识别（需 STT 模型）。"
+      },
+      "voice_max_duration": {
+        "name": "语音最大识别时长（秒）",
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "hint": "仅当语音时长不超过此值时才会尝试识别（0 表示不限制）。超过此秒数的语音会直接替换为 [长语音 X秒]。"
+      }
+    }
   },
-  "max_unmentioned_messages": {
-    "name": "Max Unmentioned Messages",
-    "type": "integer",
-    "default": 5,
-    "hint": "Max unmentioned message count to be added to buffer as context"
+
+  "section_group_sustain": {
+    "type": "section",
+    "name": "群聊持续对话",
+    "collapsed": true,
+    "fields": {
+      "sustain_enabled": {
+        "name": "启用群聊持续对话",
+        "type": "switch",
+        "default": false,
+        "hint": "开启后，AI 回复后的一段时间内，群聊中的非唤醒消息有机会自动触发再次回复"
+      },
+      "sustain_window_seconds": {
+        "name": "群聊持续窗口（秒）",
+        "type": "number",
+        "default": 180,
+        "minimum": 1,
+        "hint": "AI 每次回复后，在此时间内收到的非唤醒消息才有机会触发持续回复"
+      },
+      "sustain_reply_probability": {
+        "name": "群聊持续回复概率",
+        "type": "number",
+        "default": 0.5,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "窗口内收到非唤醒消息时，触发再次回复的概率"
+      },
+      "max_sustain_replies": {
+        "name": "群聊最大持续回复次数",
+        "type": "integer",
+        "default": -1,
+        "minimum": -1,
+        "hint": "一次唤醒后最多连续回复的次数（-1 表示无限）"
+      },
+      "sustain_stop_keywords": {
+        "name": "用户消息停止关键词（群聊）",
+        "type": "list",
+        "default": [],
+        "hint": "当用户消息包含这些关键词（不区分大小写）时，自动停止持续对话"
+      },
+      "stop_on_ai_keywords": {
+        "name": "AI回复停止关键词（群聊）",
+        "type": "list",
+        "default": [
+            "晚安",
+            "再见",
+            "拜拜",
+            "下次再聊",
+            "下次聊",
+            "不聊了",
+            "不想理",
+            "不理你",
+            "不说了"
+        ],
+        "hint": "当 AI 回复内容中包含这些关键词（不区分大小写）时，自动停止持续对话"
+      },
+      "stop_on_ai_empty": {
+        "name": "AI空消息停止持续回复（群聊）",
+        "type": "switch",
+        "default": true,
+        "hint": "当 AI 输出仅包含空消息（<msg/> 或 <msg></msg>）时，自动停止持续对话"
+      },
+      "sustain_mode": {
+        "name": "群聊持续回复模式",
+        "type": "enum",
+        "options": ["per_message", "per_round"],
+        "default": "per_round",
+        "hint": "per_message: 窗口内每条非唤醒消息独立判断概率；per_round: 窗口内只判断第一条非唤醒消息，后续不再判断"
+      }
+    }
   },
-  "group_chat_prompt": {
-    "name": "Group Chat Prompt",
-    "type": "markdown",
-    "default": "",
-    "hint": "Extra prompt for AI to better behave in group chat"
+
+  "section_dm_sustain": {
+    "type": "section",
+    "name": "私聊持续对话",
+    "collapsed": true,
+    "fields": {
+      "dm_sustain_enabled": {
+        "name": "启用私聊持续对话",
+        "type": "switch",
+        "default": false,
+        "hint": "开启后，AI 在私聊回复后，若用户在窗口内未回复，可主动再次发送消息"
+      },
+      "dm_sustain_window_range": {
+        "name": "私聊窗口时间范围（基准/波动）",
+        "type": "string",
+        "default": "60s/45s",
+        "hint": "格式如 30s/10s（等待20~40秒），1min/30s（30~90秒）。支持 h/m/s 单位"
+      },
+      "dm_sustain_reply_probability": {
+        "name": "私聊主动回复概率",
+        "type": "number",
+        "default": 0.3,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "窗口超时后触发主动回复的概率"
+      },
+      "dm_max_sustain_replies": {
+        "name": "私聊最大持续回复次数",
+        "type": "integer",
+        "default": -1,
+        "minimum": -1,
+        "hint": "-1 表示无限"
+      },
+      "dm_sustain_mode": {
+        "name": "私聊持续模式",
+        "type": "enum",
+        "options": ["per_round", "per_retry"],
+        "default": "per_retry",
+        "hint": "per_round: 每次AI回复后只尝试一次；per_retry: 失败后继续重试直到成功或达到上限"
+      },
+      "dm_max_retry_attempts": {
+        "name": "私聊最大重试次数",
+        "type": "integer",
+        "default": 3,
+        "minimum": 1,
+        "hint": "仅 per_retry 模式生效，连续失败达到此次数后停止"
+      },
+      "dm_sustain_stop_keywords": {
+        "name": "用户消息停止关键词（私聊）",
+        "type": "list",
+        "default": [],
+        "hint": "用户消息包含这些词（不区分大小写）时停止持续对话"
+      },
+      "dm_stop_on_ai_keywords": {
+        "name": "AI回复停止关键词（私聊）",
+        "type": "list",
+        "default": [
+            "晚安",
+            "再见",
+            "拜拜",
+            "下次再聊",
+            "下次聊",
+            "不聊了",
+            "不想理",
+            "不理你",
+            "不说了"
+        ],
+        "hint": "AI 回复包含这些词时停止持续对话"
+      },
+      "dm_stop_on_ai_empty": {
+        "name": "AI空消息停止（私聊）",
+        "type": "switch",
+        "default": true,
+        "hint": "AI 输出 <msg/> 或 <msg></msg> 时停止持续对话"
+      },
+      "dm_allowed_users": {
+        "name": "私聊白名单（sid）",
+        "type": "list",
+        "default": [],
+        "hint": "仅对这些 sid 生效，填写后黑名单失效"
+      },
+      "dm_denied_users": {
+        "name": "私聊黑名单（sid）",
+        "type": "list",
+        "default": [],
+        "hint": "排除这些 sid，白名单为空时生效"
+      },
+      "dm_proactive_prompt": {
+        "name": "私聊主动触发提示词",
+        "type": "markdown",
+        "default": "请根据当前对话上下文，自然地主动发送一条消息，可以随意开启新话题或延续之前的聊天并使用合适的工具，认为互动时机不佳也可以直接发送</msg>。不要提及这是主动触发。",
+        "hint": "当私聊持续对话触发主动发送时，此内容将作为用户消息发给AI，AI会据此回复。"
+      },
+      "dm_tool_blacklist": {
+        "name": "私聊主动触发的禁用工具名称",
+        "type": "list",
+        "default": [],
+        "hint": "在私聊主动触发时，禁止 AI 使用这些工具（如 memory_add, github_search）。留空表示不限制。"
+      },
+      "dm_tool_blacklist_mode": {
+        "name": "私聊工具黑名单匹配模式",
+        "type": "enum",
+        "options": ["partial", "exact"],
+        "default": "partial",
+        "hint": "partial: 工具名包含关键词即禁用；exact: 完全匹配才禁用"
+      }
+    }
   },
-  "group_proactive_chat": {
-    "name": "Group Proactive Chat",
-    "type": "switch",
-    "default": false,
-    "hint": "Allow AI to send messages proactively in group chats, be sure to have receive_unmentioned enabled"
-  },
-  "group_proactive_chat_probability": {
-    "name": "Group Proactive Chat Probability",
-    "type": "float",
-    "default": 0.1,
-    "hint": "Probability of triggering a proactive message (default 0.1)"
-  },
-  "image_recognition_only_on_mention": {
-    "name": "仅唤醒消息识图",
-    "type": "switch",
-    "default": true,
-    "hint": "为true时，只有唤醒消息（@或唤醒词）中的图片/动画表情会保留（识别）；非唤醒消息中的全部替换为文本。为false时，所有消息中的图片/表情按概率和数量处理。"
-  },
-  "image_recognition_probability": {
-    "name": "识图概率",
-    "type": "number",
-    "default": 0.5,
-    "minimum": 0,
-    "maximum": 1,
-    "hint": "非唤醒消息中图片/表情被保留的概率（仅在image_recognition_only_on_mention=false时生效）。"
-  },
-  "max_images_per_message": {
-    "name": "最多保留图片/表情数",
-    "type": "integer",
-    "default": 3,
-    "minimum": 0,
-    "hint": "每条消息最多保留的图片+动画表情数量（超出部分替换为文本）。仅在image_recognition_only_on_mention=false时生效。"
-  },
-  "forward_recognition_only_on_mention": {
-    "name": "仅唤醒消息解析转发",
-    "type": "switch",
-    "default": true,
-    "hint": "为true时，只有唤醒消息中的合并转发消息会被展开显示详细内容；非唤醒消息中的转发消息替换为[转发消息]。为false时，所有转发消息都展开（注意：可能消耗较多token）。"
-  },
-  "voice_recognition_only_on_mention": {
-    "name": "仅唤醒消息识别语音（群聊）",
-    "type": "switch",
-    "default": true,
-    "hint": "为true时，只有唤醒消息中的语音会尝试识别；非唤醒消息中的语音替换为[语音]。"
-  },
-  "voice_private_need_mention": {
-    "name": "私聊需要引用才识别语音",
-    "type": "switch",
-    "default": true,
-    "hint": "为true时，私聊中只有引用机器人（回复）的语音才尝试识别；为false时，私聊中所有语音都尝试识别（需STT模型）。"
-  },
-  "voice_max_duration": {
-    "name": "语音最大识别时长（秒）",
-    "type": "integer",
-    "default": 0,
-    "minimum": 0,
-    "hint": "仅当语音时长不超过此值时才会尝试识别（0表示不限制）。超过此秒数的语音会直接替换为[长语音 X秒]。"
-  },
-  "sustain_enabled": {
-    "name": "启用持续对话",
-    "type": "switch",
-    "default": false,
-    "hint": "开启后，AI 回复后的一段时间内，群聊中的非唤醒消息有机会自动触发再次回复"
-  },
-  "sustain_window_seconds": {
-    "name": "持续对话窗口（秒）",
-    "type": "number",
-    "default": 180,
-    "minimum": 0,
-    "hint": "AI 每次回复后，在此时间内收到的非唤醒消息才有机会触发持续回复"
-  },
-  "sustain_reply_probability": {
-    "name": "持续回复概率",
-    "type": "number",
-    "default": 0.5,
-    "minimum": 0,
-    "maximum": 1,
-    "hint": "窗口内收到非唤醒消息时，触发再次回复的概率"
-  },
-  "max_sustain_replies": {
-    "name": "最大持续回复次数",
-    "type": "integer",
-    "default": -1,
-    "minimum": -1,
-    "hint": "一次唤醒后最多连续回复的次数（-1 表示无限）"
-  },
-  "sustain_stop_keywords": {
-    "name": "用户消息停止关键词",
-    "type": "list",
-    "default": [],
-    "hint": "当用户消息包含这些关键词（不区分大小写）时，自动停止持续对话，例如 [\"不想理\", \"别说了\"]"
-  },
-  "stop_on_ai_keywords": {
-    "name": "AI回复停止关键词",
-    "type": "list",
-    "default": [],
-    "hint": "当 AI 回复内容中包含这些关键词（不区分大小写）时，自动停止持续对话，例如 [\"不聊了\", \"晚安\"]"
-  },
-  "stop_on_ai_empty": {
-    "name": "AI空消息停止持续回复",
-    "type": "switch",
-    "default": true,
-    "hint": "当 AI 输出仅包含空消息（<msg/> 或 <msg></msg>）时，自动停止持续对话"
-  },
-  "sustain_mode": {
-    "name": "持续回复模式",
-    "type": "enum",
-    "options": ["per_message", "per_round"],
-    "default": "per_message",
-    "hint": "per_message: 窗口内每条非唤醒消息独立判断概率；per_round: 窗口内只判断第一条非唤醒消息，后续不再判断"
+
+  "section_scheduled": {
+    "type": "section",
+    "name": "定时主动任务",
+    "collapsed": true,
+    "fields": {
+      "scheduled_enabled": {
+        "name": "启用定时主动任务",
+        "type": "switch",
+        "default": false,
+        "hint": "开启后，按设定时间自动在指定会话中发送消息"
+      },
+      "scheduled_sessions": {
+        "name": "定时任务会话列表（sid）",
+        "type": "list",
+        "default": [],
+        "hint": "填写要执行任务的 sid，如 qq:gm:123456 或 qq:dm:7890"
+      },
+      "scheduled_max_per_round": {
+        "name": "每轮最多发送会话数",
+        "type": "integer",
+        "default": 1,
+        "minimum": 1,
+        "hint": "每次触发时从列表中随机抽取最多多少个会话发送"
+      },
+      "scheduled_type": {
+        "name": "调度类型",
+        "type": "enum",
+        "options": ["interval", "cron"],
+        "default": "interval",
+        "hint": "interval: 间隔式（基准/波动）；cron: Cron 表达式"
+      },
+      "scheduled_interval_expression": {
+        "name": "间隔表达式",
+        "type": "string",
+        "default": "5m/270s",
+        "hint": "格式如 5m/30s（4.5~5.5分钟），1h/10m（50~70分钟）。支持 h/m/s 单位"
+      },
+      "scheduled_cron": {
+        "name": "Cron 表达式",
+        "type": "string",
+        "default": "0 */1 * * *",
+        "hint": "仅当调度类型为 cron 时生效，如 0 9 * * * 表示每天9点"
+      },
+      "scheduled_context_count": {
+        "name": "上下文消息条数",
+        "type": "integer",
+        "default": 10,
+        "minimum": 1,
+        "hint": "读取历史消息时最多取多少条"
+      },
+      "scheduled_fetch_history": {
+        "name": "拉取历史（若为空）",
+        "type": "switch",
+        "default": true,
+        "hint": "若会话无历史，尝试从 OneBot API 拉取最近消息作为初始上下文"
+      },
+      "scheduled_initial_history_count": {
+        "name": "首次拉取历史条数",
+        "type": "integer",
+        "default": 10,
+        "minimum": 1,
+        "hint": "拉取历史时获取的消息条数"
+      },
+      "scheduled_prompt": {
+        "name": "定时任务提示词",
+        "type": "markdown",
+        "default": "根据人设和上下文自然发言与使用你想用的工具并返回结果，严禁暴露这是定时任务",
+        "hint": "插入到 system prompt 中指导 AI 行为，例如：根据上下文自然发言，严禁暴露这是定时任务"
+      },
+      "scheduled_tool_blacklist": {
+        "name": "定时任务禁用工具名称",
+        "type": "list",
+        "default": [],
+        "hint": "在定时任务触发时，禁止 AI 使用这些工具（如 memory_add, github_search）。留空表示不限制。"
+      },
+      "scheduled_tool_blacklist_mode": {
+        "name": "定时任务工具黑名单匹配模式",
+        "type": "enum",
+        "options": ["partial", "exact"],
+        "default": "partial",
+        "hint": "partial: 工具名包含关键词即禁用；exact: 完全匹配才禁用"
+      }
+    }
   }
 }
