@@ -263,6 +263,18 @@
         "default": "请根据当前对话上下文，自然地主动发送一条消息，可以随意开启新话题或延续之前的聊天并使用合适的工具，认为互动时机不佳也可以直接发送</msg>。不要提及这是主动触发。",
         "hint": "当私聊持续对话触发主动发送时，此内容将作为用户消息发给AI，AI会据此回复。"
       },
+      "dm_retry_on_user_stop": {
+        "name": "用户停止词触发重试",
+        "type": "switch",
+        "default": true,
+        "hint": "per_retry 模式下，用户消息包含停止词时是否算作一次失败并继续重试（形成延后并有机会再次主动回复）"
+      },
+      "dm_retry_on_ai_stop": {
+        "name": "AI停止词/空消息触发重试",
+        "type": "switch",
+        "default": true,
+        "hint": "per_retry 模式下，AI 回复包含停止词或输出空消息时是否算作一次失败并继续重试（形成延后并有机会再次主动回复）"
+      },
       "dm_tool_blacklist": {
         "name": "私聊主动触发的禁用工具名称",
         "type": "list",
