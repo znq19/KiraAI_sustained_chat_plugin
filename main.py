@@ -9,8 +9,6 @@ from core.plugin import BasePlugin, logger, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
-from core.agent.message import OpenAIMessage
-from core.prompt_manager import Prompt
 
 try:
     from croniter import croniter
@@ -102,7 +100,7 @@ class DebouncePlugin(BasePlugin):
         # 群聊持续状态
         self.sustain_until = defaultdict(float)
         self.sustain_count = defaultdict(int)
-        self.sustain_tasks = defaultdict(asyncio.Task)
+        self.sustain_tasks: dict[str, asyncio.Task] = {}
         self.sustain_judged = defaultdict(bool)
 
         # 私聊持续状态
@@ -179,16 +177,17 @@ class DebouncePlugin(BasePlugin):
             return int(expr)
         except ValueError:
             pass
-        match = re.match(r'^(\d+)\s*(h|m|s)$', expr, re.IGNORECASE)
+        # 兼容 schema 提示中的 1min/30s、1h、30s 等写法
+        match = re.match(r'^(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)$', expr, re.IGNORECASE)
         if match:
             val, unit = match.groups()
             val = int(val)
-            if unit.lower() == 'h':
+            unit = unit.lower()
+            if unit.startswith('h'):
                 return val * 3600
-            elif unit.lower() == 'm':
+            if unit.startswith('m'):
                 return val * 60
-            else:
-                return val
+            return val
         return 0
 
     def _parse_window_range(self, range_str: str) -> tuple[int, int]:
@@ -217,19 +216,27 @@ class DebouncePlugin(BasePlugin):
         return True
 
     def _filter_tools(self, tool_set, blacklist: List[str], mode: str):
-        if not blacklist or not tool_set:
+        """按黑名单过滤 ToolSet。
+
+        官方 ToolSet.tools 是 BaseTool 实例列表（见 core/agent/tool.py），
+        不是 OpenAI function dict；应使用 tool.name + tool_set.remove。
+        """
+        if not blacklist or not tool_set or not getattr(tool_set, "tools", None):
             return
-        to_remove = []
-        for tool in tool_set.tools:
-            name = tool.get("function", {}).get("name", "")
+        to_remove: list[str] = []
+        for tool in list(tool_set.tools):
+            name = getattr(tool, "name", None) or ""
+            if not name:
+                continue
             if mode == "partial":
                 if any(kw in name for kw in blacklist):
-                    to_remove.append(tool)
+                    to_remove.append(name)
             else:
                 if name in blacklist:
-                    to_remove.append(tool)
-        for t in to_remove:
-            tool_set.tools.remove(t)
+                    to_remove.append(name)
+        if to_remove:
+            tool_set.remove(*to_remove)
+            logger.debug(f"[Proactive] 已从 tool_set 移除工具: {to_remove}")
 
     def _is_empty_msg(self, xml: str) -> bool:
         pattern = r'^\s*<msg\s*/>\s*$|^\s*<msg>\s*</msg>\s*$'
@@ -267,33 +274,59 @@ class DebouncePlugin(BasePlugin):
             self.sustain_judged[sid] = False
 
     async def _end_sustain_window(self, sid: str):
-        await asyncio.sleep(self.sustain_window_seconds)
-        if self._is_in_sustain_window(sid):
-            self.sustain_until.pop(sid, None)
-            self.sustain_count.pop(sid, None)
-            self.sustain_judged.pop(sid, None)
+        try:
+            await asyncio.sleep(self.sustain_window_seconds)
+        except asyncio.CancelledError:
+            return
+        # 超时后整状态清除（含计数），结束本轮持续对话
+        # 若窗口已被提前关闭/刷新，deadline 会变化或消失，避免误清
+        deadline = self.sustain_until.get(sid, 0)
+        if deadline and time.time() >= deadline:
+            self._clear_sustain_state(sid)
+            logger.debug(f"[Sustain] 群 {sid} 持续窗口超时结束")
 
-    def _clear_sustain_state(self, sid: str):
-        if sid in self.sustain_until:
-            self.sustain_until.pop(sid, None)
-        if sid in self.sustain_count:
+    def _clear_sustain_window(self, sid: str, keep_count: bool = False):
+        """清除群聊持续窗口状态。
+
+        keep_count=True 时保留连续回复计数（命中后关闭窗口、等 AI 再开窗时使用）。
+        keep_count=False 时连同计数一并清除（超时/停止词/达上限等）。
+        """
+        self.sustain_until.pop(sid, None)
+        if not keep_count:
             self.sustain_count.pop(sid, None)
         if sid in self.sustain_tasks and not self.sustain_tasks[sid].done():
             self.sustain_tasks[sid].cancel()
         self.sustain_tasks.pop(sid, None)
         self.sustain_judged.pop(sid, None)
 
+    def _clear_sustain_state(self, sid: str):
+        """完全清除群聊持续状态（含连续计数）。"""
+        self._clear_sustain_window(sid, keep_count=False)
+
     # ========== 私聊持续对话 ==========
     def _is_in_dm_sustain(self, sid: str) -> bool:
         return self.dm_sustain_active.get(sid, False) and time.time() < self.dm_sustain_until.get(sid, 0)
 
     def _cancel_dm_sustain(self, sid: str):
+        """仅取消私聊持续窗口，保留主动回复计数与重试计数。"""
         if sid in self.dm_sustain_tasks and not self.dm_sustain_tasks[sid].done():
             self.dm_sustain_tasks[sid].cancel()
         self.dm_sustain_tasks.pop(sid, None)
         self.dm_sustain_active[sid] = False
         self.dm_sustain_until.pop(sid, None)
-        # 不重置重试计数，保留以便记录
+
+    def _reset_dm_sustain_count(self, sid: str):
+        """重置私聊主动回复计数与重试计数（用户真实发言 / 停止词结束一轮时）。"""
+        prev = self.dm_sustain_count.get(sid, 0)
+        self.dm_sustain_count.pop(sid, None)
+        self.dm_sustain_retry_count.pop(sid, None)
+        if prev:
+            logger.debug(f"[DM Sustain] 重置主动回复计数: {sid}（原 {prev}）")
+
+    def _clear_dm_sustain_state(self, sid: str):
+        """完全清除私聊持续状态（窗口 + 计数）。"""
+        self._cancel_dm_sustain(sid)
+        self._reset_dm_sustain_count(sid)
 
     def _start_dm_sustain_window(self, sid: str):
         # 检查是否为私聊会话
@@ -306,7 +339,11 @@ class DebouncePlugin(BasePlugin):
             return
         if not self._is_dm_allowed(sid):
             return
-        if self.dm_max_sustain_replies != -1 and self.dm_sustain_count[sid] >= self.dm_max_sustain_replies:
+        current_count = self.dm_sustain_count.get(sid, 0)
+        if self.dm_max_sustain_replies != -1 and current_count >= self.dm_max_sustain_replies:
+            logger.debug(
+                f"[DM Sustain] 已达最大主动回复次数 {self.dm_max_sustain_replies}，不再开窗: {sid}"
+            )
             return
         # 取消旧窗口
         self._cancel_dm_sustain(sid)
@@ -314,10 +351,14 @@ class DebouncePlugin(BasePlugin):
         deadline = time.time() + wait_seconds
         self.dm_sustain_until[sid] = deadline
         self.dm_sustain_active[sid] = True
-        # 注意：不重置 dm_sustain_retry_count，由外部控制
+        # 注意：不重置 dm_sustain_retry_count / dm_sustain_count，由外部控制
         task = asyncio.create_task(self._dm_sustain_loop(sid, wait_seconds))
         self.dm_sustain_tasks[sid] = task
-        logger.debug(f"[DM Sustain] 窗口启动: {sid}, 等待 {wait_seconds}s, 截止 {deadline:.1f}, 当前重试计数 {self.dm_sustain_retry_count.get(sid, 0)}")
+        logger.debug(
+            f"[DM Sustain] 窗口启动: {sid}, 等待 {wait_seconds}s, "
+            f"主动次数 {current_count}/{self.dm_max_sustain_replies if self.dm_max_sustain_replies != -1 else '∞'}, "
+            f"重试计数 {self.dm_sustain_retry_count.get(sid, 0)}"
+        )
 
     def _handle_dm_failure(self, sid: str, reason: str = ""):
         """处理私聊主动触发失败（概率未命中、停止词等），根据模式决定重试或取消"""
@@ -351,11 +392,22 @@ class DebouncePlugin(BasePlugin):
 
         rand_val = random.random()
         if rand_val < self.dm_sustain_reply_probability:
-            logger.info(f"[DM Sustain] 触发主动回复: {sid} (概率 {rand_val:.2f} < {self.dm_sustain_reply_probability})")
             self.dm_sustain_count[sid] += 1
-            # 成功发送后重置重试计数
+            count = self.dm_sustain_count[sid]
+            # 成功发送后重置重试计数（保留主动次数）
             self.dm_sustain_retry_count[sid] = 0
+            logger.info(
+                f"[DM Sustain] 触发主动回复: {sid} "
+                f"(概率 {rand_val:.2f} < {self.dm_sustain_reply_probability})，"
+                f"连续主动次数 {count}"
+                + (
+                    f"/{self.dm_max_sustain_replies}"
+                    if self.dm_max_sustain_replies != -1
+                    else ""
+                )
+            )
             await self._trigger_dm_proactive(sid)
+            # 只关窗，保留 count，供后续 on_llm_response / 下次开窗判断 max
             self._cancel_dm_sustain(sid)
         else:
             logger.debug(f"[DM Sustain] 未命中: {sid} (概率 {rand_val:.2f} >= {self.dm_sustain_reply_probability})")
@@ -373,7 +425,10 @@ class DebouncePlugin(BasePlugin):
             logger.error(f"[DM Sustain] 无法获取适配器: {adapter_name}")
             return
 
+        # 对齐官方 PluginContext.publish_notice 的事件构造方式
+        # （core/plugin/plugin_context.py），再覆盖 session 到真实私聊 sid
         from core.chat import KiraMessageEvent, KiraIMMessage, User, Session, MessageChain
+        cur_time = int(time.time())
         user = User(user_id="system_proactive_dm", nickname="系统主动触发")
         chain = MessageChain([Text(self.dm_proactive_prompt)])
 
@@ -381,24 +436,22 @@ class DebouncePlugin(BasePlugin):
             adapter=adapter.info,
             message_types=adapter.message_types,
             message=KiraIMMessage(
-                timestamp=int(time.time()),
+                timestamp=cur_time,
                 sender=user,
                 message_id="system_proactive",
-                self_id=str(adapter.config.get("self_id", "")),
+                self_id=str(adapter.config.get("self_id", "") or ""),
                 chain=chain,
                 is_notice=False,
-                is_mentioned=True
+                is_mentioned=True,
             ),
-            timestamp=int(time.time())
+            timestamp=cur_time,
         )
+        # __post_init__ 会按 sender 生成错误 session，必须覆盖为真实私聊会话
         event.session = Session(
             adapter_name=adapter_name,
             session_type="dm",
-            session_id=session_id
+            session_id=session_id,
         )
-        event._is_proactive = True
-        event._proactive_blacklist = self.dm_tool_blacklist
-        event._proactive_blacklist_mode = self.dm_tool_blacklist_mode
 
         try:
             await self.ctx.message_processor.handle_im_message(event)
@@ -491,33 +544,35 @@ class DebouncePlugin(BasePlugin):
             logger.warning(f"[Scheduler] 会话 {sid} 无历史，跳过")
             return
 
-        from core.chat import KiraMessageEvent, KiraIMMessage, User, Session, MessageChain
+        # 对齐官方 publish_notice 构造；群聊必须带 group，否则 is_group_message() 会错
+        from core.chat import KiraMessageEvent, KiraIMMessage, User, Group, Session, MessageChain
+        cur_time = int(time.time())
         user = User(user_id="system_scheduled", nickname="定时任务")
         prompt_text = self.scheduled_prompt or "请根据当前对话上下文，自然地发送一条消息。"
         chain = MessageChain([Text(prompt_text)])
+        group = Group(group_id=session_id) if session_type == "gm" else None
 
         event = KiraMessageEvent(
             adapter=adapter.info,
             message_types=adapter.message_types,
             message=KiraIMMessage(
-                timestamp=int(time.time()),
+                timestamp=cur_time,
                 sender=user,
+                group=group,
                 message_id="scheduled_task",
-                self_id=str(adapter.config.get("self_id", "")),
+                self_id=str(adapter.config.get("self_id", "") or ""),
                 chain=chain,
                 is_notice=False,
-                is_mentioned=True
+                is_mentioned=True,
             ),
-            timestamp=int(time.time())
+            timestamp=cur_time,
         )
+        # 覆盖为配置中的真实会话（__post_init__ 对 system 用户可能生成错误 sid）
         event.session = Session(
             adapter_name=adapter_name,
             session_type=session_type,
-            session_id=session_id
+            session_id=session_id,
         )
-        event._is_proactive = True
-        event._proactive_blacklist = self.scheduled_tool_blacklist
-        event._proactive_blacklist_mode = self.scheduled_tool_blacklist_mode
 
         try:
             await self.ctx.message_processor.handle_im_message(event)
@@ -597,31 +652,48 @@ class DebouncePlugin(BasePlugin):
 
         # === 私聊持续对话：用户消息处理 ===
         if self.dm_sustain_enabled and not event.is_group_message():
-            # 检查是否在窗口中
-            if self._is_in_dm_sustain(sid):
-                text_content = "".join(elem.text for elem in event.message.chain if isinstance(elem, Text))
-                # 检查用户停止词
-                if self._check_user_stop_keywords(text_content, self.dm_sustain_stop_keywords):
-                    # 判断是否将用户停止词视为失败并重试
-                    if self.dm_sustain_mode == "per_retry" and self.dm_retry_on_user_stop:
-                        # 视为失败，重试或取消
-                        self._handle_dm_failure(sid, "用户停止词")
-                        # 丢弃这条消息，因为已经触发了重试逻辑
-                        event.discard()
-                        return
-                    else:
-                        # 直接取消窗口
-                        self._cancel_dm_sustain(sid)
-                        logger.debug(f"[DM Sustain] 用户停止词触发，取消窗口: {sid}")
-                        # 仍然将消息丢弃（不进入缓冲）
-                        event.discard()
-                        return
-                else:
-                    # 用户消息到达，取消窗口（正常交互）
-                    self._cancel_dm_sustain(sid)
-                    logger.debug(f"[DM Sustain] 用户消息到达，取消窗口: {sid}")
+            sender_id = str(event.message.sender.user_id) if event.message.sender else ""
+            # 系统主动触发消息不参与用户侧逻辑（避免刚 +1 的 count 被清掉）
+            is_proactive_msg = sender_id in ("system_proactive_dm", "system_scheduled")
 
-        # === 群聊持续对话（原有） ===
+            if not is_proactive_msg:
+                text_content = "".join(
+                    elem.text for elem in event.message.chain if isinstance(elem, Text)
+                )
+                in_window = self._is_in_dm_sustain(sid)
+
+                # 仅在持续窗口内处理停止词（避免非窗口期误丢弃正常消息）
+                if in_window and self._check_user_stop_keywords(
+                    text_content, self.dm_sustain_stop_keywords
+                ):
+                    if self.dm_sustain_mode == "per_retry" and self.dm_retry_on_user_stop:
+                        # 算失败重试，不重置主动次数
+                        self._handle_dm_failure(sid, "用户停止词")
+                        event.discard()
+                        return
+                    self._clear_dm_sustain_state(sid)
+                    logger.debug(f"[DM Sustain] 用户停止词触发，结束本轮: {sid}")
+                    event.discard()
+                    return
+
+                # 真实用户发言：取消等待中的主动窗口，并重置主动次数（开启新一轮）
+                # 这样 max 不会在用户回来后永久卡死
+                if in_window or self.dm_sustain_count.get(sid, 0):
+                    logger.debug(
+                        f"[DM Sustain] 用户消息到达，取消窗口并重置计数: {sid} "
+                        f"（原主动次数 {self.dm_sustain_count.get(sid, 0)}）"
+                    )
+                self._cancel_dm_sustain(sid)
+                self._reset_dm_sustain_count(sid)
+
+        # === 群聊持续对话 ===
+        # 真实唤醒（@ / 唤醒词）：开启新一轮，重置连续计数
+        if self.sustain_enabled and event.is_group_message() and event.is_mentioned:
+            if self.sustain_count.get(sid, 0) or self._is_in_sustain_window(sid):
+                logger.debug(f"[Sustain] 群 {sid} 真实唤醒，重置连续计数（原 {self.sustain_count.get(sid, 0)}）")
+            self.sustain_count[sid] = 0
+            self._clear_sustain_window(sid, keep_count=True)
+
         if self.sustain_enabled and event.is_group_message() and not event.is_mentioned:
             if self._is_in_sustain_window(sid):
                 if self.max_sustain_replies != -1 and self.sustain_count[sid] >= self.max_sustain_replies:
@@ -634,19 +706,44 @@ class DebouncePlugin(BasePlugin):
                         return
 
                     if self.sustain_mode == "per_message":
+                        # 窗口内每条非唤醒消息都独立判断；
+                        # 未命中：窗口继续，下一条仍可判；
+                        # 命中：回复并关窗（保留计数），等 AI 回复后再开新窗
                         if random.random() < self.sustain_reply_probability:
                             event.message.is_mentioned = True
                             self.sustain_count[sid] += 1
-                            self._clear_sustain_state(sid)
-                            logger.debug(f"[Sustain] 群 {sid} 持续对话命中（per_message），连续次数 {self.sustain_count[sid]}")
+                            self._clear_sustain_window(sid, keep_count=True)
+                            logger.debug(
+                                f"[Sustain] 群 {sid} 持续对话命中（per_message），连续次数 {self.sustain_count[sid]}"
+                            )
+                            if (
+                                self.max_sustain_replies != -1
+                                and self.sustain_count[sid] >= self.max_sustain_replies
+                            ):
+                                logger.debug(
+                                    f"[Sustain] 群 {sid} 已达最大持续次数 {self.max_sustain_replies}，"
+                                    f"AI 回复后将不再开窗"
+                                )
                     else:
+                        # per_round：窗口内只判断第一条；
+                        # 未命中：本窗口不再判断；命中：关窗保留计数，等 AI 再开窗
                         if not self.sustain_judged.get(sid, False):
                             self.sustain_judged[sid] = True
                             if random.random() < self.sustain_reply_probability:
                                 event.message.is_mentioned = True
                                 self.sustain_count[sid] += 1
-                                self._clear_sustain_state(sid)
-                                logger.debug(f"[Sustain] 群 {sid} 持续对话命中（per_round），连续次数 {self.sustain_count[sid]}")
+                                self._clear_sustain_window(sid, keep_count=True)
+                                logger.debug(
+                                    f"[Sustain] 群 {sid} 持续对话命中（per_round），连续次数 {self.sustain_count[sid]}"
+                                )
+                                if (
+                                    self.max_sustain_replies != -1
+                                    and self.sustain_count[sid] >= self.max_sustain_replies
+                                ):
+                                    logger.debug(
+                                        f"[Sustain] 群 {sid} 已达最大持续次数 {self.max_sustain_replies}，"
+                                        f"AI 回复后将不再开窗"
+                                    )
                             else:
                                 logger.debug(f"[Sustain] 群 {sid} 持续对话未命中，本窗口不再判断")
 
@@ -707,11 +804,23 @@ class DebouncePlugin(BasePlugin):
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse):
         sid = event.sid
 
+        # 官方 AgentExecutor 在每一步都会触发 ON_LLM_RESPONSE（含 tool_calls 中间步）。
+        # 持续对话只应在「最终文本回复」时处理，否则会误开窗/误判停止词。
+        if resp.tool_calls:
+            return
+
+        ai_text = (resp.text_response or "").strip()
+
         # === 私聊持续对话 ===
         if not event.is_group_message() and self.dm_sustain_enabled:
             if self._is_dm_allowed(sid):
-                if self.dm_max_sustain_replies == -1 or self.dm_sustain_count[sid] < self.dm_max_sustain_replies:
-                    ai_text = resp.text_response.strip()
+                current_count = self.dm_sustain_count.get(sid, 0)
+                if self.dm_max_sustain_replies != -1 and current_count >= self.dm_max_sustain_replies:
+                    logger.debug(
+                        f"[DM Sustain] AI 回复完成但已达最大主动次数 "
+                        f"{current_count}/{self.dm_max_sustain_replies}，不再开窗: {sid}"
+                    )
+                else:
                     should_stop = False
                     stop_reason = ""
                     if self.dm_stop_on_ai_empty and self._is_empty_msg(ai_text):
@@ -723,19 +832,22 @@ class DebouncePlugin(BasePlugin):
 
                     if should_stop:
                         if self.dm_sustain_mode == "per_retry" and self.dm_retry_on_ai_stop:
-                            # 视为失败，重试或取消
+                            # 视为失败，重试或取消（不重置主动次数）
                             self._handle_dm_failure(sid, f"AI {stop_reason}")
                         else:
-                            self._cancel_dm_sustain(sid)
-                            logger.debug(f"[DM Sustain] AI {stop_reason}，取消窗口: {sid}")
+                            # 明确结束本轮
+                            self._clear_dm_sustain_state(sid)
+                            logger.debug(f"[DM Sustain] AI {stop_reason}，结束本轮: {sid}")
                     else:
-                        # 正常回复，启动新窗口
+                        # 正常回复，启动新窗口（count 已在主动触发时 +1，此处不改 count）
                         self._start_dm_sustain_window(sid)
-                        logger.debug(f"[DM Sustain] AI 回复完成，启动窗口: {sid}")
+                        logger.debug(
+                            f"[DM Sustain] AI 回复完成，启动窗口: {sid} "
+                            f"（当前主动次数 {current_count}）"
+                        )
 
-        # === 群聊持续对话（原有） ===
+        # === 群聊持续对话 ===
         if event.is_group_message() and self.sustain_enabled:
-            ai_text = resp.text_response.strip()
             should_stop = False
             if self.stop_on_ai_empty and self._is_empty_msg(ai_text):
                 should_stop = True
@@ -748,10 +860,17 @@ class DebouncePlugin(BasePlugin):
                 self._clear_sustain_state(sid)
                 return
 
-            if not resp.tool_calls:
-                if self.max_sustain_replies == -1 or self.sustain_count[sid] < self.max_sustain_replies:
-                    self._start_sustain_window(sid)
-                    logger.debug(f"[Sustain] 群 {sid} AI 回复完成，启动窗口")
+            if self.max_sustain_replies == -1 or self.sustain_count[sid] < self.max_sustain_replies:
+                self._start_sustain_window(sid)
+                logger.debug(
+                    f"[Sustain] 群 {sid} AI 回复完成，启动窗口 "
+                    f"（连续次数 {self.sustain_count.get(sid, 0)}）"
+                )
+            else:
+                logger.debug(
+                    f"[Sustain] 群 {sid} 已达最大持续次数 "
+                    f"{self.sustain_count.get(sid, 0)}/{self.max_sustain_replies}，不再开窗"
+                )
 
     # ========== LLM 请求钩子（工具黑名单过滤） ==========
     @on.llm_request(priority=Priority.HIGH)
@@ -798,12 +917,8 @@ class DebouncePlugin(BasePlugin):
                     if random.random() >= self.image_recognition_probability:
                         chain.message_list[i] = Text("[图片]" if isinstance(elem, Image) else "[动画表情]")
             elif isinstance(elem, Forward):
-                if is_mentioned:
-                    if self.forward_recognition_only_on_mention:
-                        continue
-                    else:
-                        chain.message_list[i] = Text("[转发消息]")
-                else:
+                # only_on_mention=True：仅唤醒消息保留转发；False：全部保留
+                if self.forward_recognition_only_on_mention and not is_mentioned:
                     chain.message_list[i] = Text("[转发消息]")
             elif isinstance(elem, Record):
                 duration = getattr(elem, 'duration', 0)
