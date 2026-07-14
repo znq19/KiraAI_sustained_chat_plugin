@@ -1,7 +1,7 @@
 {
     "display_name": "Sustained Chat",
     "plugin_id": "sustained-chat",
-    "version": "2.0.2",
+    "version": "2.0.3",
     "author": "KiraAI+znq19",
     "description": "基于原版 Default Chat 优化非唤醒消息识别和增加持续回复、主动回复功能。",
     "repo": "https://github.com/znq19/KiraAI_sustained_chat_plugin"
