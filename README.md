@@ -202,9 +202,36 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.0.2
+- 当前版本：v2.0.3
 - 兼容 KiraAI：v2.6.1+
 - 作者：KiraAI + znq19
+
+<details>
+<summary>更新日志</summary>
+
+### v2.0.3
+
+**群聊持续对话**
+- 修复最大持续回复次数（`max_sustain_replies`）不计数的问题：命中后误调用整状态清理，导致计数被立刻清零
+- 命中后改为仅关闭窗口并**保留计数**，AI 回复后再开新窗；达上限后不再开窗
+- 真实唤醒（@ / 唤醒词）时重置连续计数，避免上一轮 max 卡死
+- 明确 `per_message` / `per_round` 语义：两者命中后均关窗再开新窗；差别仅在未命中时是否继续判断后续消息
+
+**私聊持续对话**
+- 修复 `dm_max_sustain_replies` 只增不减、达上限后永久不再开窗的问题
+- 用户真实发言时重置主动次数；主动触发成功时正确累加并保留计数
+- 系统主动消息不再被误判为用户消息而清掉计数
+- 日志补充当前主动次数 / 上限，便于排查
+
+**框架对齐与其它修复**
+- 对照官方 `core` 修复工具黑名单过滤：`ToolSet.tools` 为 `BaseTool` 实例，不再按 OpenAI function dict 解析
+- `ON_LLM_RESPONSE` 跳过含 `tool_calls` 的中间步，仅在最终文本回复时处理持续窗口
+- 修复转发消息开关逻辑：`forward_recognition_only_on_mention=false` 时正确保留全部转发
+- 定时任务构造群聊事件时补全 `Group`，避免 `is_group_message()` 误判
+- 时间表达式兼容 `1min` / `mins` 等写法；修正 `sustain_tasks` 初始化方式
+- 补全被截断的 `_limit_media_count` 方法，修复插件无法加载的语法错误
+
+</details>
 
 ---
 
