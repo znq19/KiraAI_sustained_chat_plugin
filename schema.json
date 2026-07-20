@@ -37,7 +37,7 @@
       },
       "group_proactive_chat_probability": {
         "name": "群聊主动发言概率",
-        "type": "number",
+        "type": "float",
         "default": 0.1,
         "minimum": 0,
         "maximum": 1,
@@ -59,7 +59,7 @@
       },
       "image_recognition_probability": {
         "name": "识图概率",
-        "type": "number",
+        "type": "float",
         "default": 0.5,
         "minimum": 0,
         "maximum": 1,
@@ -95,7 +95,7 @@
         "type": "integer",
         "default": 0,
         "minimum": 0,
-        "hint": "仅当语音时长不超过此值时才会尝试识别（0 表示不限制）。超过此秒数的语音会直接替换为 [长语音 X秒]。"
+        "hint": "仅当语音时长不超过此值时才会尝试识别（0 表示不限制）。超过此秒数的语音会直接替换为 [长语音 X秒]。对缺少时长元数据的语音（如被引用的机器人自己的语音）会尽力估算时长后再判断。"
       }
     }
   },
@@ -113,14 +113,14 @@
       },
       "sustain_window_seconds": {
         "name": "群聊持续窗口（秒）",
-        "type": "number",
+        "type": "float",
         "default": 180,
         "minimum": 1,
         "hint": "AI 每次回复后，在此时间内收到的非唤醒消息才有机会触发持续回复"
       },
       "sustain_reply_probability": {
         "name": "群聊持续回复概率",
-        "type": "number",
+        "type": "float",
         "default": 0.5,
         "minimum": 0,
         "maximum": 1,
@@ -190,7 +190,7 @@
       },
       "dm_sustain_reply_probability": {
         "name": "私聊主动回复概率",
-        "type": "number",
+        "type": "float",
         "default": 0.3,
         "minimum": 0,
         "maximum": 1,
