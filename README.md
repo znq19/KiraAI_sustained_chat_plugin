@@ -1,5 +1,5 @@
 
-# KiraAI_sustained_chat_plugin/可持续聊天 
+# KiraAI_sustained_chat_plugin/可持续聊天 2.1.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
