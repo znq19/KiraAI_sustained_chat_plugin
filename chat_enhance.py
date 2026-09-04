@@ -640,6 +640,23 @@ class ChatEnhanceEngine:
         self.ctx = ctx
         self.plugin = plugin
         self.presence = PresenceThrottle(cfg)
+        self.dm_presence_enabled = bool(cfg.get("dm_presence_enabled", True))
+        _dm_cfg = {
+            "presence_window_size": _safe_int(cfg.get("dm_presence_window_size"), 10),
+            "presence_decay_minutes": _safe_float(cfg.get("presence_decay_minutes"), 10),
+            "presence_target_ratio": _safe_float(cfg.get("dm_presence_target_ratio"), 0.7),
+            "presence_k_min": _safe_float(cfg.get("dm_presence_k_min"), 0.5),
+            "presence_k_max": max(_safe_float(cfg.get("dm_presence_k_min"), 0.5), _safe_float(cfg.get("dm_presence_k_max"), 2.0)),
+            "score_threshold": _safe_float(cfg.get("dm_score_threshold"), 30),
+            "score_increment": _safe_float(cfg.get("dm_score_increment"), 2),
+            "score_penalty": _safe_float(cfg.get("dm_score_penalty"), 3),
+            "score_cap": _safe_float(cfg.get("dm_score_cap"), 50),
+            "idle_bonus_score": _safe_float(cfg.get("dm_idle_bonus_score"), 15),
+            "idle_bonus_ratio": _safe_float(cfg.get("dm_idle_bonus_ratio"), 1.5),
+        }
+        self.dm_presence = PresenceThrottle(_dm_cfg) if self.dm_presence_enabled else self.presence
+        self.mentioned_dm_score_gate_deny = bool(cfg.get("mentioned_dm_score_gate_deny", False))
+        self.mentioned_dm_score_gate_boost = bool(cfg.get("mentioned_dm_score_gate_boost", False))
         self.harass = HarassDetector(cfg, plugin)
         self.dormant = DormantState(cfg)
         self.merger = NoticeMerger(plugin, merge_seconds)
@@ -652,7 +669,16 @@ class ChatEnhanceEngine:
         self.dm_sustain_score_gate_deny = bool(cfg.get("dm_sustain_score_gate_deny", False))
         self.dm_sustain_score_gate_boost = bool(cfg.get("dm_sustain_score_gate_boost", False))
         self.force_suppress = bool(cfg.get("force_suppress", False))
+        # 评分补正：提及消息（@/关键词/引用）独立控制
+        self.mentioned_score_gate_deny = bool(cfg.get("mentioned_score_gate_deny", False))
+        self.mentioned_score_gate_boost = bool(cfg.get("mentioned_score_gate_boost", False))
         self._prune_task: Optional[asyncio.Task] = None
+
+    def _get_presence(self, is_dm: bool = False) -> "PresenceThrottle":
+        """返回群聊（self.presence）或私聊（self.dm_presence）的 PresenceThrottle。"""
+        if is_dm and self.dm_presence_enabled:
+            return self.dm_presence
+        return self.presence
 
     # ---- 生命周期 ----
 
@@ -666,6 +692,8 @@ class ChatEnhanceEngine:
                 await asyncio.sleep(3600)
                 # 各组件内部按 7 天闲置判断回收，活跃会话（最近有活动）天然保留
                 self.presence.prune(set())
+                if self.dm_presence_enabled:
+                    self.dm_presence.prune(set())
                 self.dormant.prune(set())
                 self.harass.prune()
             except asyncio.CancelledError:
@@ -688,7 +716,8 @@ class ChatEnhanceEngine:
         """在宿主 handle_msg 中调用：存在感记录 + 骚扰检测 + 休眠判定。"""
         sid = event.session.sid
         now = time.time()
-        self.presence.note_incoming(sid, now, is_bot=False)
+        is_dm = not getattr(event, "is_group_message", lambda: True)()
+        self._get_presence(is_dm).note_incoming(sid, now, is_bot=False)
 
         # 骚扰检测（戳/at/关键词/引用）
         kind = self._detect_kind(event)
@@ -791,7 +820,8 @@ class ChatEnhanceEngine:
             return
         sid = str(sid)
         now = time.time()
-        self.presence.note_bot_reply(sid, now)
+        is_dm = not getattr(event, "is_group_message", lambda: True)()
+        self._get_presence(is_dm).note_bot_reply(sid, now)
         self.dormant.note_reply(sid, now)
 
     # ---- 消息发送（宿主 on.message_sent 调用）：存在感统计 ----
@@ -801,11 +831,12 @@ class ChatEnhanceEngine:
             sid = str(event.session.sid)
         except Exception:
             return
-        self.presence.note_bot_reply(sid, time.time())
+        is_dm = not getattr(event, "is_group_message", lambda: True)()
+        self._get_presence(is_dm).note_bot_reply(sid, time.time())
 
     # ---- 评分补正（宿主概率触发处调用） ----
 
-    def score_gate(self, sid: str, prob_hit: bool, scope: str = "default") -> bool:
+    def score_gate(self, sid: str, prob_hit: bool, scope: str = "default", is_dm: bool = False) -> bool:
         """评分补正：返回是否应触发（累计加分机制）。
 
         三个通路（default/sustain/dm_sustain）各有 deny（门槛过滤）和 boost（补偿触发）独立开关。
@@ -821,18 +852,19 @@ class ChatEnhanceEngine:
         if self.score_threshold <= 0:
             return prob_hit
         now = time.time()
-        score = self.presence.score(sid, now)
+        presence = self._get_presence(is_dm)
+        score = presence.score(sid, now)
         # 闲时加分：静默超该会话历史平均 × idle_bonus_ratio 时 +idle_bonus
-        if self.presence.idle_bonus > 0 and self.presence.idle_bonus_ok(sid, now):
-            score += self.presence.idle_bonus
-        if prob_hit and score < self.score_threshold:
+        if presence.idle_bonus > 0 and presence.idle_bonus_ok(sid, now):
+            score += presence.idle_bonus
+        if prob_hit and score < presence.score_threshold:
             # 概率命中 + 评分不足 → deny 开启时拦下
             if deny:
                 return False
-        if score >= self.score_threshold:
+        if score >= presence.score_threshold:
             # 评分够 → boost 开启时（或 deny+boost 同时开）触发并清零
             if boost:
-                self.presence.consume_score(sid)
+                presence.consume_score(sid)
                 return True
         return prob_hit
 
@@ -842,11 +874,16 @@ class ChatEnhanceEngine:
             return self.sustain_score_gate_deny, self.sustain_score_gate_boost
         elif scope == "dm_sustain":
             return self.dm_sustain_score_gate_deny, self.dm_sustain_score_gate_boost
-        else:
-            return self.score_gate_deny, self.score_gate_boost
+        elif scope == "mentioned":
+            return self.mentioned_score_gate_deny, self.mentioned_score_gate_boost
+        elif scope == "mentioned_dm":
+            return self.mentioned_dm_score_gate_deny, self.mentioned_dm_score_gate_boost
+        return self.score_gate_deny, self.score_gate_boost
 
-    def k_prob(self, sid: str) -> float:
-        return self.presence.k_prob(sid, time.time())
+    def k_prob(self, sid: str, is_dm: bool = False) -> float:
+        return self._get_presence(is_dm).k_prob(sid, time.time())
 
     def idle_bonus(self, sid: str) -> float:
-        return self.presence.idle_bonus if self.presence.idle_bonus_ok(sid, time.time()) else 0.0
+        is_dm = False  # caller doesn't have context; group fallback
+        p = self._get_presence(is_dm)
+        return p.idle_bonus if p.idle_bonus_ok(sid, time.time()) else 0.0

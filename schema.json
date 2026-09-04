@@ -54,6 +54,24 @@
         "name": "主动屏蔽工具（manage_ignore）",
         "default": true,
         "hint": "关闭后 bot 不再能主动调用屏蔽工具（仍可响应 XML tag 屏蔽），默认开启"
+      },
+      "proactive_score_gate_deny": {
+        "name": "门槛过滤（群聊主动概率）",
+        "type": "switch",
+        "default": true,
+        "hint": "群聊主动概率路径：概率命中但累计分不足时阻止触发，分继续攒"
+      },
+      "proactive_score_gate_boost": {
+        "name": "补偿触发（群聊主动概率）",
+        "type": "switch",
+        "default": true,
+        "hint": "群聊主动概率路径：概率未命中但累计分达标时强制触发并清零"
+      },
+      "proactive_k_prob_enabled": {
+        "name": "概率调节（群聊主动概率）",
+        "type": "switch",
+        "default": true,
+        "hint": "群聊主动概率是否受 k_prob 调节系数影响（回少提高/回多降低）"
       }
     }
   },
@@ -222,6 +240,12 @@
         "type": "switch",
         "default": false,
         "hint": "群聊持续对话：概率未命中但累计分达标时强制触发并清零"
+      },
+      "sustain_k_prob_enabled": {
+        "name": "概率调节",
+        "type": "switch",
+        "default": false,
+        "hint": "群聊持续对话是否受 k_prob 调节系数影响（回少提高/回多降低）"
       }
     }
   },
@@ -365,6 +389,78 @@
         "type": "switch",
         "default": false,
         "hint": "私聊持续对话：概率未命中但累计分达标时强制触发并清零"
+      },
+      "dm_k_prob_enabled": {
+        "name": "概率调节",
+        "type": "switch",
+        "default": false,
+        "hint": "私聊持续对话是否受 k_prob 调节系数影响（回少提高/回多降低）"
+      },
+      "dm_presence_enabled": {
+        "name": "私聊独立存在感节流",
+        "type": "switch",
+        "default": true,
+        "hint": "私聊使用独立的存在感节流/评分参数。关则与群聊共享"
+      },
+      "dm_presence_window_size": {
+        "name": "私聊窗口条数",
+        "type": "integer",
+        "default": 10,
+        "hint": "取最近 N 条消息计算 bot 发言占比"
+      },
+      "dm_presence_target_ratio": {
+        "name": "私聊发言占比基准",
+        "type": "float",
+        "default": 0.7,
+        "hint": "bot 发言占比基准（0-1），高于它降概率、低于它提概率"
+      },
+      "dm_presence_k_min": {
+        "name": "私聊概率下限",
+        "type": "float",
+        "default": 0.5,
+        "hint": "概率调节系数最小值（0-1，1 为不降）"
+      },
+      "dm_presence_k_max": {
+        "name": "私聊概率上限",
+        "type": "float",
+        "default": 2.0,
+        "hint": "概率调节系数最大值（1-2）"
+      },
+      "dm_score_threshold": {
+        "name": "私聊评分阈值",
+        "type": "float",
+        "default": 30,
+        "hint": "累计分达标阈值"
+      },
+      "dm_score_increment": {
+        "name": "私聊加分",
+        "type": "float",
+        "default": 2,
+        "hint": "用户消息 +N 分"
+      },
+      "dm_score_penalty": {
+        "name": "私聊扣分",
+        "type": "float",
+        "default": 3,
+        "hint": "bot 回复 -N 分"
+      },
+      "dm_score_cap": {
+        "name": "私聊评分上限",
+        "type": "float",
+        "default": 50,
+        "hint": "累计分上限"
+      },
+      "dm_idle_bonus_score": {
+        "name": "私聊闲时加分",
+        "type": "float",
+        "default": 15,
+        "hint": "静默时长高于平均时加分"
+      },
+      "dm_idle_bonus_ratio": {
+        "name": "私聊闲时判定倍数",
+        "type": "float",
+        "default": 1.5,
+        "hint": "静默 > 平均 × 倍数才算闲时"
       }
     }
   },
@@ -701,17 +797,29 @@
         "default": 1.5,
         "hint": "相对判定：静默时长超过该会话历史平均静默 × 倍数才算闲时（冷场）。活跃群/死群标准不同。0=不判闲时（闲时加分关闭）"
       },
-      "score_gate_deny": {
-        "name": "门槛过滤（评分不足时阻止概率命中）",
+      "mentioned_score_gate_deny": {
+        "name": "门槛过滤（提及消息）",
         "type": "switch",
         "default": false,
-        "hint": "概率命中后累计分不足阈值则阻止触发，分数保留继续攒"
+        "hint": "@/关键词/引用消息：评分不足时阻止触发，降级为未提及处理"
       },
-      "score_gate_boost": {
-        "name": "补偿触发（评分达标时强制补发）",
+      "mentioned_score_gate_boost": {
+        "name": "补偿触发（提及消息）",
         "type": "switch",
         "default": false,
-        "hint": "概率未命中但累计分达阈值则强制补偿触发，触发后清零"
+        "hint": "@/关键词/引用消息：分够时强制触发（默认关，即提及消息不受评分影响）"
+      },
+      "mentioned_dm_score_gate_deny": {
+        "name": "门槛过滤（私聊提及消息）",
+        "type": "switch",
+        "default": false,
+        "hint": "私聊用户消息：评分不足时阻止触发（默认关，即私聊用户消息不受评分影响）"
+      },
+      "mentioned_dm_score_gate_boost": {
+        "name": "补偿触发（私聊提及消息）",
+        "type": "switch",
+        "default": false,
+        "hint": "私聊用户消息：分够时强制触发"
       }
     }
   },
