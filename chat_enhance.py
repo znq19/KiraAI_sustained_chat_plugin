@@ -652,6 +652,9 @@ class ChatEnhanceEngine:
         self.dm_sustain_score_gate_deny = bool(cfg.get("dm_sustain_score_gate_deny", False))
         self.dm_sustain_score_gate_boost = bool(cfg.get("dm_sustain_score_gate_boost", False))
         self.force_suppress = bool(cfg.get("force_suppress", False))
+        # 评分补正：提及消息（@/关键词/引用）独立控制
+        self.mentioned_score_gate_deny = bool(cfg.get("mentioned_score_gate_deny", False))
+        self.mentioned_score_gate_boost = bool(cfg.get("mentioned_score_gate_boost", False))
         self._prune_task: Optional[asyncio.Task] = None
 
     # ---- 生命周期 ----
@@ -842,8 +845,9 @@ class ChatEnhanceEngine:
             return self.sustain_score_gate_deny, self.sustain_score_gate_boost
         elif scope == "dm_sustain":
             return self.dm_sustain_score_gate_deny, self.dm_sustain_score_gate_boost
-        else:
-            return self.score_gate_deny, self.score_gate_boost
+        elif scope == "mentioned":
+            return self.mentioned_score_gate_deny, self.mentioned_score_gate_boost
+        return self.score_gate_deny, self.score_gate_boost
 
     def k_prob(self, sid: str) -> float:
         return self.presence.k_prob(sid, time.time())
