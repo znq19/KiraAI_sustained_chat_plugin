@@ -54,6 +54,9 @@ class DebouncePlugin(BasePlugin):
         self.group_chat_prompt = basic.get("group_chat_prompt", '### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[动画表情]或[图片]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n')
         self.group_proactive_chat = basic.get("group_proactive_chat", False)
         self.group_proactive_chat_probability = _safe_float(basic.get("group_proactive_chat_probability"), 0.1)
+        self.proactive_k_prob_enabled = basic.get("proactive_k_prob_enabled", True)
+        self.proactive_score_gate_deny = basic.get("proactive_score_gate_deny", True)
+        self.proactive_score_gate_boost = basic.get("proactive_score_gate_boost", True)
         self.proactive_scope_sessions = set(
             str(x) for x in (basic.get("proactive_scope_sessions") or [])
         )
@@ -86,6 +89,7 @@ class DebouncePlugin(BasePlugin):
         self.sustain_judge_timing = group_sustain.get("sustain_judge_timing", "either")
         # 空 msg 后评分补上再触发（默认关）：bot 空 msg 只是"这次不回"，不是"这轮结束"
         self.sustain_retry_on_empty = bool(group_sustain.get("sustain_retry_on_empty", False))
+        self.sustain_k_prob_enabled = group_sustain.get("sustain_k_prob_enabled", False)
 
         # ========== 从 section_dm_sustain 读取私聊持续对话配置 ==========
         dm_sustain = cfg.get("section_dm_sustain", {})
@@ -112,6 +116,7 @@ class DebouncePlugin(BasePlugin):
         self.dm_retry_on_ai_stop = dm_sustain.get("dm_retry_on_ai_stop", True)
         # 空 msg 后评分补上再触发（默认关）：bot 空 msg 只是"这次不回"，不是"这轮结束"
         self.dm_retry_on_empty = bool(dm_sustain.get("dm_retry_on_empty", False))
+        self.dm_k_prob_enabled = dm_sustain.get("dm_k_prob_enabled", False)
 
         # ========== 从 section_scheduled 读取定时任务配置 ==========
         scheduled = cfg.get("section_scheduled", {})
@@ -188,6 +193,21 @@ class DebouncePlugin(BasePlugin):
         for _k in ("dm_sustain_score_gate_deny", "dm_sustain_score_gate_boost"):
             if _k in _dmscope:
                 _enhance_cfg[_k] = _dmscope[_k]
+        # 群聊主动概率的评分补正（从 section_basic 透传至引擎 default scope）
+        _basic = cfg.get("section_basic", {}) or {}
+        # proactive_score_gate_deny/boost → 引擎的 score_gate_deny/boost（default scope）
+        _enhance_cfg["score_gate_deny"] = _basic.get("proactive_score_gate_deny", True)
+        _enhance_cfg["score_gate_boost"] = _basic.get("proactive_score_gate_boost", True)
+        # 私聊独立参数（从 section_dm_sustain 透传）
+        _dmparams = cfg.get("section_dm_sustain", {}) or {}
+        for _k in ("dm_presence_enabled", "dm_presence_window_size", "dm_presence_target_ratio",
+                   "dm_presence_k_min", "dm_presence_k_max",
+                   "dm_score_threshold", "dm_score_increment", "dm_score_penalty",
+                   "dm_score_cap", "dm_idle_bonus_score", "dm_idle_bonus_ratio"):
+            if _k in _dmparams:
+                _enhance_cfg[_k] = _dmparams[_k]
+        # 提及消息评分补正（从 section_presence 透传，已 flatten）
+        # 注释：section_presence 的密钥已在上面 flatten 循环中透传
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
 
     async def initialize(self):
@@ -638,9 +658,11 @@ class DebouncePlugin(BasePlugin):
             self._cancel_dm_sustain(sid)
             return
         # 存在感节流：概率 × k_prob（回少提高/回多降低）+ 评分补正
-        _dm_prob = self.dm_sustain_reply_probability * self.enhance.k_prob(sid)
+        _dm_prob = self.dm_sustain_reply_probability
+        if self.dm_k_prob_enabled:
+            _dm_prob *= self.enhance.k_prob(sid, is_dm=True)
         _dm_hit = rand_val < _dm_prob
-        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain"):
+        if self.enhance.score_gate(sid, _dm_hit, scope="dm_sustain", is_dm=True):
             self.dm_sustain_count[sid] += 1
             count = self.dm_sustain_count[sid]
             # 成功发送后重置重试计数（保留主动次数）
@@ -915,6 +937,15 @@ class DebouncePlugin(BasePlugin):
             self._process_media(event.message.chain, is_mentioned, is_private=True)
 
         sid = event.session.sid
+        # 评分补正对提及消息的影响（存在感节流下独立控制）
+        if event.is_mentioned and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
+            is_dm = not event.is_group_message()
+            scope = "mentioned_dm" if is_dm else "mentioned"
+            mentioned_gate = self.enhance.score_gate(sid, True, scope=scope, is_dm=is_dm)
+            if not mentioned_gate:
+                # deny 生效：评分不足时阻止触发，降级为未提及
+                event.is_mentioned = False
+
         # 注意：不在此记录 _last_ignore_sid（旧实现）。ignore/wake_extend tag 是
         # LLM 回复的输出，on_llm_response 已记录本次回复所属会话；handle_msg 里
         # 记录会被任意新消息（含不触发 LLM 的围观消息）覆盖，造成 tag 作用到
@@ -998,7 +1029,9 @@ class DebouncePlugin(BasePlugin):
                         if self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
                             logger.debug(f"[Sustain] 群 {sid} 休眠期内不介入（per_message）")
                         else:
-                            _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
+                            _sustain_prob = self.sustain_reply_probability
+                            if self.sustain_k_prob_enabled:
+                                _sustain_prob *= self.enhance.k_prob(sid)
                             _sustain_hit = random.random() < _sustain_prob
                             if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
                                 event.message.is_mentioned = True
@@ -1028,7 +1061,9 @@ class DebouncePlugin(BasePlugin):
                                 logger.debug(f"[Sustain] 群 {sid} 休眠期内不介入（per_round）")
                             else:
                                 # 存在感节流：概率 × k_prob + 评分补正
-                                _sustain_prob = self.sustain_reply_probability * self.enhance.k_prob(sid)
+                                _sustain_prob = self.sustain_reply_probability
+                                if self.sustain_k_prob_enabled:
+                                    _sustain_prob *= self.enhance.k_prob(sid)
                                 _sustain_hit = random.random() < _sustain_prob
                                 if self.enhance.score_gate(sid, _sustain_hit, scope="sustain"):
                                     event.message.is_mentioned = True
@@ -1062,7 +1097,9 @@ class DebouncePlugin(BasePlugin):
                         and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid) \
                         and self._is_proactive_allowed(sid):
                     # 存在感节流：概率 × k_prob（回少提高/回多降低）
-                    prob = self.group_proactive_chat_probability * self.enhance.k_prob(sid)
+                    prob = self.group_proactive_chat_probability
+                    if self.proactive_k_prob_enabled:
+                        prob *= self.enhance.k_prob(sid)
                     prob_hit = random.random() < prob
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
                     if self.enhance.score_gate(sid, prob_hit):

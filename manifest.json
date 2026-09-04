@@ -1,7 +1,7 @@
 {
   "display_name": "Sustained Chat 可持续聊天",
   "plugin_id": "sustained-chat",
-  "version": "2.4.2",
+  "version": "2.4.4",
   "author": "KiraAI+znq19",
   "description": "基于原版 Default Chat 优化积压队列、非唤醒消息识别和增加持续回复、主动回复功能的聊天增强插件。v2.4.0 新增：存在感节流（回少提高/回多降低）、骚扰感知化（戳/at/关键词/引用检测+XML决策屏蔽）、休眠时段（起夜概率+维持期+主动续窗）。",
   "repo": "https://github.com/znq19/KiraAI_sustained_chat_plugin",
