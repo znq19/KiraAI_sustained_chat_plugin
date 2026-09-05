@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.4
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.4.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -347,12 +347,16 @@ croniter>=1.3.0
 
 ## 📝 版本信息
 
-- 当前版本：v2.4.4
+- 当前版本：v2.4.5
 - 兼容 KiraAI：v2.29.6+（插件图标需 v2.30.0+）
 - 作者：KiraAI + znq19
 
 <details>
 <summary>更新日志</summary>
+
+### v2.4.5
+
+- **队列合并防抖修复**：`_push_pending` 防抖等待移到锁外（之前 await 在锁内阻塞队列处理 + 防抖重置不生效）
 
 ### v2.4.4
 
