@@ -228,6 +228,21 @@ class DebouncePlugin(BasePlugin):
                 _enhance_cfg[_k] = _dmparams[_k]
         # 提及消息评分补正（从 section_presence 透传，已 flatten）
         # 注释：section_presence 的密钥已在上面 flatten 循环中透传
+        # 额外信号（user_msgs/session_msgs 群聊+私聊开关与参数；bot_speech 仅群聊）
+        _detect = cfg.get("section_detect", {}) or {}
+        for _k in ("detect_user_msgs", "detect_session_msgs", "detect_bot_speech",
+                   "dm_detect_user_msgs", "dm_detect_session_msgs"):
+            if _k in _detect:
+                _enhance_cfg[_k] = _detect[_k]
+        _th = cfg.get("section_thresholds", {}) or {}
+        for _k in ("user_msgs_window_seconds", "user_msgs_threshold",
+                   "session_msgs_window_seconds", "session_msgs_threshold",
+                   "bot_speech_window_seconds", "bot_speech_threshold",
+                   "dm_user_msgs_window_seconds", "dm_user_msgs_threshold",
+                   "dm_session_msgs_window_seconds", "dm_session_msgs_threshold",
+                   "extra_default_duration"):
+            if _k in _th:
+                _enhance_cfg[_k] = _th[_k]
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
 
     async def initialize(self):

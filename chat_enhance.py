@@ -323,27 +323,43 @@ class HarassDetector:
         return f"已屏蔽 {scope_txt} 的 {kind} 唤醒 {dur_txt}"
 
     def apply_ignore_from_tag(self, sid: str, kind: str, value: str) -> str:
-        """解析 XML tag 值：user|duration:N / all|duration:N / none。"""
+        """解析 XML tag 值：user|duration:N / all|duration:N / none。
+
+        额外信号通知格式 <ignore>user:{uid}|type:{kind}|duration:N</ignore>：
+        - user:{uid}：内嵌具体用户 ID（无需反查最近触发者）
+        - type:{kind}：指定信号类型（user_msgs/session_msgs…），缺省沿用 tag 的 kind
+        """
         value = (value or "").strip()
         if not value or value.lower() == "none":
             return ""
         parts = [p.strip() for p in value.split("|")]
         target = parts[0].lower()
         duration = 0
+        uid_inline = None
+        kind_inline = kind
+        # parts[0] 可为 user:{uid}（额外信号通知格式）或 user/all（旧格式）
+        if target == "all":
+            uid_inline = "*"
+        elif target.startswith("user:"):
+            uid_inline = target[5:] or None
         for p in parts[1:]:
             if p.startswith("duration:"):
                 try:
                     duration = int(p.split(":", 1)[1])
                 except (ValueError, IndexError):
                     duration = 0
-        if target in ("user", "all"):
-            uid = "*" if target == "all" else None
+            elif p.startswith("type:"):
+                kind_inline = p.split(":", 1)[1].strip() or kind
+            elif p.startswith(("user_id:", "uid:")):
+                uid_inline = p.split(":", 1)[1].strip() or None
+        if uid_inline is not None:
+            return self.apply_ignore(sid, uid_inline, kind_inline, duration)
+        if target == "user":
             # user 需要具体用户 ID：tag 里没带时用最近触发者
+            uid = self._last_trigger_user(sid, kind_inline)
             if uid is None:
-                uid = self._last_trigger_user(sid, kind)
-                if uid is None:
-                    return "（无法确定目标用户，未屏蔽）"
-            return self.apply_ignore(sid, uid, kind, duration)
+                return "（无法确定目标用户，未屏蔽）"
+            return self.apply_ignore(sid, uid, kind_inline, duration)
         return ""
 
     def _last_trigger_user(self, sid: str, kind: str) -> Optional[str]:
@@ -682,6 +698,29 @@ class ChatEnhanceEngine:
         # 评分补正：提及消息（@/关键词/引用）独立控制
         self.mentioned_score_gate_deny = bool(cfg.get("mentioned_score_gate_deny", False))
         self.mentioned_score_gate_boost = bool(cfg.get("mentioned_score_gate_boost", False))
+        # 额外信号（user_msgs/session_msgs 群聊与私聊都可检测，各自独立开关/参数：
+        # 群聊走 detect_user_msgs/session_msgs + user/session_msgs_* 参数；
+        # 私聊走 dm_detect_* + dm_* 参数，默认关。bot_speech 仅群聊。）
+        self.detect_user_msgs = bool(cfg.get("detect_user_msgs", False))
+        self.detect_session_msgs = bool(cfg.get("detect_session_msgs", False))
+        self.dm_detect_user_msgs = bool(cfg.get("dm_detect_user_msgs", False))
+        self.dm_detect_session_msgs = bool(cfg.get("dm_detect_session_msgs", False))
+        self.detect_bot_speech = bool(cfg.get("detect_bot_speech", False))
+        self.user_msgs_window = _safe_float(cfg.get("user_msgs_window_seconds"), 60)
+        self.user_msgs_threshold = _safe_int(cfg.get("user_msgs_threshold"), 10)
+        self.session_msgs_window = _safe_float(cfg.get("session_msgs_window_seconds"), 60)
+        self.session_msgs_threshold = _safe_int(cfg.get("session_msgs_threshold"), 20)
+        self.dm_user_msgs_window = _safe_float(cfg.get("dm_user_msgs_window_seconds"), 60)
+        self.dm_user_msgs_threshold = _safe_int(cfg.get("dm_user_msgs_threshold"), 10)
+        self.dm_session_msgs_window = _safe_float(cfg.get("dm_session_msgs_window_seconds"), 60)
+        self.dm_session_msgs_threshold = _safe_int(cfg.get("dm_session_msgs_threshold"), 20)
+        self.bot_speech_window = _safe_float(cfg.get("bot_speech_window_seconds"), 300)
+        self.bot_speech_threshold = _safe_int(cfg.get("bot_speech_threshold"), 10)
+        # 额外信号默认屏蔽时长（通知里建议 bot 使用的 duration；独立于各骚扰类别的 default_duration）
+        self.extra_default_duration = _safe_int(cfg.get("extra_default_duration"), 180)
+        self._extra_counts: dict[str, dict[str, deque]] = defaultdict(
+            lambda: {k: deque(maxlen=512) for k in ("bot_speech", "user_msgs", "session_msgs")}
+        )
         self._prune_task: Optional[asyncio.Task] = None
 
     def _get_presence(self, is_dm: bool = False) -> "PresenceThrottle":
@@ -706,6 +745,12 @@ class ChatEnhanceEngine:
                     self.dm_presence.prune(set())
                 self.dormant.prune(set())
                 self.harass.prune()
+                # 额外信号计数回收：按 deque 最新时间戳 7 天淘汰
+                for sid2 in list(self._extra_counts.keys()):
+                    for k2, dq in self._extra_counts[sid2].items():
+                        if dq and time.time() - dq[-1][0] > 7 * 86400:
+                            self._extra_counts.pop(sid2, None)
+                            break
             except asyncio.CancelledError:
                 return
             except Exception:
@@ -722,6 +767,22 @@ class ChatEnhanceEngine:
 
     # ---- 消息入口（宿主 handle_msg 调用） ----
 
+    def _build_extra_notice(self, kind: str, user_id: str, n: int, window: float, threshold: int) -> str:
+        """额外信号通知：user_msgs（单用户消息条数）/ session_msgs（会话消息条数）。
+
+        带两种拉黑选项：定向屏蔽该信号（<ignore>user:{uid}|type:{kind}|...</ignore>）
+        或全拉黑该用户（<ignore>user:{uid}|duration:...</ignore>）——bot 可主动拉黑。
+        """
+        label = {"user_msgs": f"user {user_id} sent", "session_msgs": "this session received",
+                 "bot_speech": "you spoke"}[kind]
+        dur = self.extra_default_duration
+        return (
+            f"[System: {label} {n} messages in {int(window)}s (threshold {threshold}). "
+            f"Reply with <ignore>user:{user_id}|type:{kind}|duration:{dur}</ignore> to block "
+            f"this user\'s {kind}, or <ignore>user:{user_id}|duration:{dur}</ignore> to fully "
+            f"block, or <ignore>none</ignore> to do nothing. Ignore lasts {dur}s by default.]"
+        )
+
     def on_im_message(self, event) -> None:
         """在宿主 handle_msg 中调用：存在感记录 + 骚扰检测 + 休眠判定。"""
         sid = event.session.sid
@@ -736,6 +797,36 @@ class ChatEnhanceEngine:
             notice = self.harass.check(sid, kind, user_id, now)
             if notice:
                 self.merger.queue(sid, notice)
+
+        # 额外信号（user_msgs/session_msgs 群聊与私聊都可检测，各自独立开关/参数：
+        # 群聊走 detect_user_msgs/session_msgs + user/session_msgs_* 参数；
+        # 私聊走 dm_detect_* + dm_* 参数，默认关。bot_speech 仅群聊。）
+        if is_dm:
+            if self.dm_detect_user_msgs and not self.harass.is_ignored(sid, self._sender_id(event), "user_msgs", now):
+                self._extra_counts[sid]["user_msgs"].append((now, self._sender_id(event)))
+                n = sum(1 for ts, u in self._extra_counts[sid]["user_msgs"] if ts >= now - self.dm_user_msgs_window and u == self._sender_id(event))
+                if n >= self.dm_user_msgs_threshold:
+                    self._extra_counts[sid]["user_msgs"].clear()
+                    self.merger.queue(sid, self._build_extra_notice("user_msgs", self._sender_id(event), n, self.dm_user_msgs_window, self.dm_user_msgs_threshold))
+            if self.dm_detect_session_msgs and not self.harass.is_ignored(sid, self._sender_id(event), "session_msgs", now):
+                self._extra_counts[sid]["session_msgs"].append((now, self._sender_id(event)))
+                n = sum(1 for ts, _ in self._extra_counts[sid]["session_msgs"] if ts >= now - self.dm_session_msgs_window)
+                if n >= self.dm_session_msgs_threshold:
+                    self._extra_counts[sid]["session_msgs"].clear()
+                    self.merger.queue(sid, self._build_extra_notice("session_msgs", self._sender_id(event), n, self.dm_session_msgs_window, self.dm_session_msgs_threshold))
+        else:
+            if self.detect_user_msgs and not self.harass.is_ignored(sid, self._sender_id(event), "user_msgs", now):
+                self._extra_counts[sid]["user_msgs"].append((now, self._sender_id(event)))
+                n = sum(1 for ts, u in self._extra_counts[sid]["user_msgs"] if ts >= now - self.user_msgs_window and u == self._sender_id(event))
+                if n >= self.user_msgs_threshold:
+                    self._extra_counts[sid]["user_msgs"].clear()
+                    self.merger.queue(sid, self._build_extra_notice("user_msgs", self._sender_id(event), n, self.user_msgs_window, self.user_msgs_threshold))
+            if self.detect_session_msgs and not self.harass.is_ignored(sid, self._sender_id(event), "session_msgs", now):
+                self._extra_counts[sid]["session_msgs"].append((now, self._sender_id(event)))
+                n = sum(1 for ts, _ in self._extra_counts[sid]["session_msgs"] if ts >= now - self.session_msgs_window)
+                if n >= self.session_msgs_threshold:
+                    self._extra_counts[sid]["session_msgs"].clear()
+                    self.merger.queue(sid, self._build_extra_notice("session_msgs", self._sender_id(event), n, self.session_msgs_window, self.session_msgs_threshold))
 
         # 休眠判定：休眠期内被提及 → 起夜概率
         _just_woken = False
@@ -764,6 +855,11 @@ class ChatEnhanceEngine:
             if isinstance(raw, dict) and raw.get("notice_type") == "notify" \
                     and raw.get("sub_type") == "poke":
                 return "poke"
+            return None
+        # 私聊消息：框架（qq.py 私聊路径）is_mentioned 写死 True（私聊=天然提及，
+        # 无 @ 概念），at/关键词/引用检测对私聊无意义——会把正常私聊误判成骚扰。
+        # 只保留上述 poke 检测，其余 kind 对私聊一律不检测。
+        if not getattr(event, "is_group_message", lambda: True)():
             return None
         # 引用回复
         for m in getattr(event.message, "chain", []):
@@ -843,6 +939,17 @@ class ChatEnhanceEngine:
             return
         is_dm = not getattr(event, "is_group_message", lambda: True)()
         self._get_presence(is_dm).note_bot_reply(sid, time.time())
+        # bot_speech 额外信号（仅群聊：私聊 bot 发言频率由自身主动逻辑控制；
+        # 私聊对应开关 dm_* 不适用于 bot 自身发言）
+        if not self.detect_bot_speech or is_dm:
+            return
+        now = time.time()
+        if not self.harass.is_ignored(sid, "bot", "bot_speech", now):
+            self._extra_counts[sid]["bot_speech"].append((now, "bot"))
+            n = sum(1 for ts, _ in self._extra_counts[sid]["bot_speech"] if ts >= now - self.bot_speech_window)
+            if n >= self.bot_speech_threshold:
+                self._extra_counts[sid]["bot_speech"].clear()
+                self.merger.queue(sid, self._build_extra_notice("bot_speech", "bot", n, self.bot_speech_window, self.bot_speech_threshold))
 
     # ---- 评分补正（宿主概率触发处调用） ----
 

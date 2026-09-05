@@ -1116,5 +1116,107 @@
         "hint": "这些会话不检测骚扰，填了不生效。格式如 qq:gm:123456"
       }
     }
+  },
+  "section_detect": {
+    "type": "section",
+    "name": "额外防骚扰信号",
+    "collapsed": false,
+    "hint": "检测用户刷屏/会话刷屏/bot 自己刷屏等额外骚扰信号群聊与私聊开关（私聊默认关）；bot_speech 仅群聊",
+    "fields": {
+      "detect_user_msgs": {
+        "type": "switch",
+        "name": "单用户消息条数检测（群聊）",
+        "default": false,
+        "hint": "时间窗内某用户消息条数达阈值时通知 bot（防刷屏轰炸）"
+      },
+      "detect_session_msgs": {
+        "type": "switch",
+        "name": "会话消息条数检测（群聊）",
+        "default": false,
+        "hint": "时间窗内会话消息条数达阈值时通知 bot（防群刷屏）"
+      },
+      "detect_bot_speech": {
+        "type": "switch",
+        "name": "bot 发言条数检测（群聊）",
+        "default": false,
+        "hint": "时间窗内 bot 自己发言条数达阈值时通知（防自己刷屏）"
+      },
+      "dm_detect_user_msgs": {
+        "type": "switch",
+        "name": "单用户消息条数检测（私聊）",
+        "default": false,
+        "hint": "私聊中某用户消息条数达阈值时通知（默认关：私聊消息频率属正常交流，主动开启后统计）"
+      },
+      "dm_detect_session_msgs": {
+        "type": "switch",
+        "name": "会话消息条数检测（私聊）",
+        "default": false,
+        "hint": "私聊会话消息条数达阈值时通知（默认关）"
+      }
+    }
+  },
+  "section_thresholds": {
+    "type": "section",
+    "name": "额外防骚扰信号参数",
+    "collapsed": true,
+    "hint": "各额外信号的窗口、阈值与默认屏蔽时长（群聊/私聊各自独立）",
+    "fields": {
+      "user_msgs_window_seconds": {
+        "type": "float",
+        "name": "单用户消息窗口（群聊，秒）",
+        "default": 60
+      },
+      "user_msgs_threshold": {
+        "type": "integer",
+        "name": "单用户消息阈值（群聊）",
+        "default": 10
+      },
+      "session_msgs_window_seconds": {
+        "type": "float",
+        "name": "会话消息窗口（群聊，秒）",
+        "default": 60
+      },
+      "session_msgs_threshold": {
+        "type": "integer",
+        "name": "会话消息阈值（群聊）",
+        "default": 20
+      },
+      "bot_speech_window_seconds": {
+        "type": "float",
+        "name": "bot 发言窗口（秒）",
+        "default": 300
+      },
+      "bot_speech_threshold": {
+        "type": "integer",
+        "name": "bot 发言阈值",
+        "default": 10
+      },
+      "dm_user_msgs_window_seconds": {
+        "type": "float",
+        "name": "单用户消息窗口（私聊，秒）",
+        "default": 60
+      },
+      "dm_user_msgs_threshold": {
+        "type": "integer",
+        "name": "单用户消息阈值（私聊）",
+        "default": 10
+      },
+      "dm_session_msgs_window_seconds": {
+        "type": "float",
+        "name": "会话消息窗口（私聊，秒）",
+        "default": 60
+      },
+      "dm_session_msgs_threshold": {
+        "type": "integer",
+        "name": "会话消息阈值（私聊）",
+        "default": 20
+      },
+      "extra_default_duration": {
+        "type": "integer",
+        "name": "额外信号默认屏蔽时长（秒）",
+        "default": 180,
+        "hint": "user_msgs/session_msgs/bot_speech 触发后通知里建议 bot 使用的屏蔽时长（独立于各骚扰类别的默认时长）"
+      }
+    }
   }
 }
