@@ -215,43 +215,61 @@ class BatchMergeScheduler:
         """agent_step_index 是否已达最大步数（框架最后一步）。
 
         框架 agent_executor 每步写入 llm_resp.agent_step_index = step_index（1 起），
-        最后一步 == max_tool_loop；该步即使仍带 tool_calls，工具执行完 agent 也会结束
-        （无最终文本收尾），故需提前标记。旧框架/其它调用方缺该字段时返回 False，
-        自动退回原行为（等卡死兜底），不出错。
+        最后一步仍为工具调用时（>= max_tool_loop），该步工具执行完 agent 即结束，
+        无最终文本收尾。提前标记让 tick/step_result 在工具执行完后立即推送 pending，
+        避免等 180s 卡死兜底才推送。
         """
-        idx = getattr(resp, "agent_step_index", None)
         try:
-            return idx is not None and int(idx) >= self.max_steps
+            idx = int(getattr(resp, "agent_step_index", 0) or 0)
+            return idx >= self.max_steps
         except (TypeError, ValueError):
             return False
 
-    # ================= 推送决策（三分支，串行） =================
+    # ================= 推送决策（in-flight 完成时） =================
 
     async def _push_pending(self, sid: str, done_event_id: str):
-        """锁内决策 + 状态更新，锁外 publish。
+        """锁内验证 + 锁外防抖 + 锁内决策，锁外 publish。
 
-        ⚠️ done_event_id 双保险：_decide_and_apply_locked 会无条件清 _inflight，
+        ⚠️ 防抖等待必须在锁外执行：await asyncio.sleep 在锁内时，
+        on_batch_message 无法获取锁来更新 _last_arrival，防抖重置永不生效；
+        且该 sid 等待期间会阻塞其他所有 sid 的队列处理。
+
+        done_event_id 双保险：_decide_and_apply_locked 会无条件清 _inflight，
         只有 in-flight 仍是本次完成事件时才允许执行；重复/过期广播直接跳过，不误清状态。
 
         防抖窗口：in-flight 完成时若 pending 非空，先等 merge_window_seconds
         （期间新消息到达会重置窗口），窗口静默后才推送——把突发合并完再 flush。
         """
-        to_publish = None
+        # 第一次检查（锁内）：验证 in-flight 匹配
+        first_check_pass = False
         async with self._lock:
             if self._inflight.get(sid) != done_event_id:
                 self._log(sid, f"忽略过期完成事件 {done_event_id}（in-flight={self._inflight.get(sid)}）")
                 return
-            if self._pending.get(sid):
-                # 防抖：等窗口静默（期间新消息重置 _last_arrival）
-                while True:
-                    last = self._last_arrival.get(sid, 0.0)
-                    wait = self.merge_window_seconds - (time.time() - last)
-                    if wait <= 0:
-                        break
-                    self._log(sid, f"防抖等待 {wait:.1f}s（窗口 {self.merge_window_seconds}s）")
-                    await asyncio.sleep(wait)
-                    # 等待期间新消息到达会更新 _last_arrival，循环重新计算
+            first_check_pass = True
+
+        if not first_check_pass:
+            return
+
+        # 防抖等待（锁外）：期间新消息到达可自由更新 _last_arrival
+        while True:
+            async with self._lock:
+                last = self._last_arrival.get(sid, 0.0)
+            wait = self.merge_window_seconds - (time.time() - last)
+            if wait <= 0:
+                break
+            self._log(sid, f"防抖等待 {wait:.1f}s（窗口 {self.merge_window_seconds}s）")
+            await asyncio.sleep(min(wait, 0.5))
+            # 每次唤醒后重新计算，等待期间新消息到达会更新 _last_arrival
+
+        # 第二次检查（锁内）：防抖期间 inflight 可能已被 tick 路径处理
+        to_publish = None
+        async with self._lock:
+            if self._inflight.get(sid) != done_event_id:
+                self._log(sid, f"防抖后 in-flight 已变更，跳过: {done_event_id}")
+                return
             to_publish = self._decide_and_apply_locked(sid)
+
         if to_publish is not None:
             n_msgs = len(to_publish.messages)
             self._log(sid, f"发布批次 {to_publish.event_id}（{n_msgs} 条消息，来自 {len(to_publish.extra.get('merged_from', []))} 个来源）")
@@ -297,100 +315,70 @@ class BatchMergeScheduler:
         return merged
 
     async def drop_sustain_pending(self, sid: str, hit_ids) -> int:
-        """丢弃 pending 中「仅由持续命中消息触发」的批次（持续对话停窗时调用）。
-
-        判定：批次内所有 mentioned 消息的 message_id 都在 hit_ids 中 → 该批次的
-        触发完全来自持续命中，丢弃；含真实唤醒消息（@/唤醒词/引用回复，mentioned
-        但不在 hit_ids）或不含任何 mentioned 消息的批次一律保留不动。
-        被丢弃批次的消息仍保留在会话缓冲中，仅少一次回复，上下文不丢。
-        只动 pending，不触碰 _inflight / _final_marked，不影响推送决策状态机。
-        返回丢弃批次数。
-        """
-        if not hit_ids:
-            return 0
+        """停窗时丢弃纯持续命中积压批次（避免停窗后旧消息仍被追加回复）。"""
         async with self._lock:
-            pending = self._pending.get(sid)
-            if not pending:
-                return 0
-            kept: list[PendingBatch] = []
-            dropped = 0
-            for pb in pending:
-                msgs = getattr(pb.batch, "messages", None) or []
-                mentioned = [m for m in msgs if getattr(m, "is_mentioned", False)]
-                if mentioned and all(getattr(m, "message_id", None) in hit_ids for m in mentioned):
-                    dropped += 1
-                    self._log(sid, f"停窗丢弃持续命中积压批次 {pb.batch.event_id}（{len(msgs)} 条）")
-                else:
-                    kept.append(pb)
+            pending = self._pending.get(sid, [])
+            before = len(pending)
+            kept = [pb for pb in pending if not self._is_sustain_only(pb, hit_ids)]
+            dropped = before - len(kept)
             if dropped:
+                self._log(sid, f"丢弃 {dropped} 个持续命中积压批次")
                 if kept:
                     self._pending[sid] = kept
                 else:
                     self._pending.pop(sid, None)
             return dropped
 
-    # ================= 阈值防护 =================
+    def _is_sustain_only(self, pb: PendingBatch, hit_ids: set) -> bool:
+        if not hit_ids:
+            return False
+        msg_ids = set()
+        for m in pb.batch.messages:
+            mid = getattr(m, "message_id", None)
+            if mid is not None:
+                msg_ids.add(str(mid))
+        return bool(msg_ids and msg_ids.issubset(hit_ids)) if hit_ids else False
+
+    # ================= 拆分 =================
 
     def _split_by_limits(self, pending: list[PendingBatch]):
-        """按 批次数 / 媒体批次 / 消息数 / token 上限拆批，返回 (to_merge, rest)。"""
-        to_merge: list[PendingBatch] = []
-        rest: list[PendingBatch] = []
-        total_msgs = 0
-        total_tokens = 0
-        media_batches = 0
-        for pb in pending:
-            msgs = len(pb.batch.messages)
-            toks = self._estimate_tokens([pb])
-            has_media = self._has_media(pb)
-            if (self.max_merge_batches_limit and len(to_merge) >= self.max_merge_batches_limit):
-                rest.append(pb)
-                continue
-            if (self.media_preprocess_enabled and self.media_preprocess_max_batches
-                    and has_media and media_batches >= self.media_preprocess_max_batches):
-                rest.append(pb)
-                continue
-            if self.max_merge_messages and total_msgs + msgs > self.max_merge_messages:
-                rest.append(pb)
-                continue
-            if self.max_merge_est_tokens and total_tokens + toks > self.max_merge_est_tokens:
-                rest.append(pb)
-                continue
-            to_merge.append(pb)
-            total_msgs += msgs
-            total_tokens += toks
-            if has_media:
-                media_batches += 1
-        if not to_merge and pending:
-            # 极端：第一个批次自身就超限 -> 仍合并它（1:1 语义，宁可超限不可丢/死循环）
-            to_merge = [pending[0]]
-            rest = pending[1:]
-        return to_merge, rest
+        """按各项上限拆分 pending 批次列表。返回 (to_merge, rest)。"""
+        batches = pending
+        merge_msgs = 0
+        merge_idx = 0
+        for i, pb in enumerate(batches):
+            n = len(pb.batch.messages)
+            if self.max_merge_batches_limit > 0 and i >= self.max_merge_batches_limit:
+                break
+            if self.max_merge_messages > 0 and merge_msgs + n > self.max_merge_messages:
+                break
+            if self.max_merge_est_tokens > 0:
+                est = self._estimate_tokens([pb])
+                if merge_idx > 0 and merge_msgs > 0 and self._estimate_tokens(batches[:i]) + est > self.max_merge_est_tokens:
+                    break
+            merge_msgs += n
+            merge_idx = i + 1
+        return pending[:merge_idx], pending[merge_idx:]
 
     def _estimate_tokens(self, batches: list[PendingBatch]) -> int:
-        """粗略估算 token：文本字符数 / 估算系数。"""
-        ratio = max(1, int(self.token_est_ratio))
         total = 0
         for pb in batches:
             for m in pb.batch.messages:
-                msg_str = getattr(m, "message_str", None) or ""
-                total += len(msg_str) // ratio
-        return total
+                try:
+                    text = getattr(m, "text", "") or ""
+                    total += len(text)
+                except Exception:
+                    total += 50
+        return int(total * self.token_est_ratio)
 
     def _has_media(self, pb: PendingBatch) -> bool:
         for m in pb.batch.messages:
-            # 本插件 stage1 暂存（_pir_media）与并行识图插件（PIR）暂存（_pir_images）
-            # 都要检查：stage1 已把媒体替换为 Text 占位符，只看 chain 元素会漏判
-            if getattr(m, "_pir_media", None):
-                return True
-            if getattr(m, "_pir_images", None):
-                return True
-            for elem in getattr(m, "chain", []) or []:
+            for elem in getattr(m, "chain", []):
                 if isinstance(elem, (Image, Sticker, Record)):
                     return True
         return False
 
     def _count_media_batches(self, pending: list[PendingBatch]) -> int:
-        """统计 pending 中含媒体元素的批次数（积压媒体限制用）。"""
         return sum(1 for pb in pending if self._has_media(pb))
 
     # ================= 批次构造 =================
@@ -459,6 +447,8 @@ class BatchMergeScheduler:
                     # in-flight 已收尾 / 空闲：正常路径，走防抖窗口（与 _push_pending 一致）。
                     # 最后一条消息到达后 merge_window_seconds 内不发布，期间新消息
                     # 到达会重置 _last_arrival，把突发合并完再 flush。
+                    # _decide_and_apply_locked 是幂等的——pop pending 为空则返回 None，
+                    # 不会被 _push_pending 重复推送。
                     last = self._last_arrival.get(sid, 0.0)
                     if now - last < self.merge_window_seconds:
                         self._log(sid, f"tick 防抖等待（窗口 {self.merge_window_seconds}s，距最后消息 {now - last:.1f}s）")
@@ -488,26 +478,21 @@ class BatchMergeScheduler:
             self._merge_task = None
             for sid, pend in self._pending.items():
                 to_publish.extend(pend)
-                for pb in pend:
-                    self._log(sid, f"shutdown 重发 pending 批次 {pb.batch.event_id}")
             self._pending.clear()
             self._inflight.clear()
             self._inflight_since.clear()
             self._final_marked.clear()
+            self._last_arrival.clear()
         if task and not task.done():
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
-        # 按 sid 分组，每 sid 合并为一个全新批次发布
-        by_sid: dict[str, list[PendingBatch]] = {}
         for pb in to_publish:
-            by_sid.setdefault(pb.batch.session.sid, []).append(pb)
-        for sid, pend in by_sid.items():
-            try:
-                fresh = self._build_merged_batch(pend)
-                self._log(sid, f"shutdown 重发合并批次 {fresh.event_id}（{len(pend)} 批次 / {len(fresh.messages)} 条）")
-                await self.ctx.event_bus.publish(fresh)
-            except Exception:
-                logger.exception("[QueueMerge] shutdown republish failed")
+            chain = pb.batch.messages[0].chain if pb.batch.messages else None
+            if chain is None:
+                continue
+            text_parts = [str(e) for e in chain if hasattr(e, "text")]
+            text = "\n".join(text_parts)[:200]
+            logger.info(f"[QueueMerge] 插件终止，积压消息转入正常管线: {text}")
