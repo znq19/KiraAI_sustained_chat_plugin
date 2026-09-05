@@ -228,30 +228,48 @@ class BatchMergeScheduler:
     # ================= 推送决策（三分支，串行） =================
 
     async def _push_pending(self, sid: str, done_event_id: str):
-        """锁内决策 + 状态更新，锁外 publish。
+        """锁内验证 + 锁外防抖 + 锁内决策，锁外 publish。
 
-        ⚠️ done_event_id 双保险：_decide_and_apply_locked 会无条件清 _inflight，
+        ⚠️ 防抖等待必须在锁外执行：await asyncio.sleep 在锁内时，
+        on_batch_message 无法获取锁来更新 _last_arrival，防抖重置永不生效；
+        且该 sid 等待期间会阻塞其他所有 sid 的队列处理。
+
+        done_event_id 双保险：_decide_and_apply_locked 会无条件清 _inflight，
         只有 in-flight 仍是本次完成事件时才允许执行；重复/过期广播直接跳过，不误清状态。
 
         防抖窗口：in-flight 完成时若 pending 非空，先等 merge_window_seconds
         （期间新消息到达会重置窗口），窗口静默后才推送——把突发合并完再 flush。
         """
-        to_publish = None
+        # 第一次检查（锁内）：验证 in-flight 匹配
+        first_check_pass = False
         async with self._lock:
             if self._inflight.get(sid) != done_event_id:
                 self._log(sid, f"忽略过期完成事件 {done_event_id}（in-flight={self._inflight.get(sid)}）")
                 return
-            if self._pending.get(sid):
-                # 防抖：等窗口静默（期间新消息重置 _last_arrival）
-                while True:
-                    last = self._last_arrival.get(sid, 0.0)
-                    wait = self.merge_window_seconds - (time.time() - last)
-                    if wait <= 0:
-                        break
-                    self._log(sid, f"防抖等待 {wait:.1f}s（窗口 {self.merge_window_seconds}s）")
-                    await asyncio.sleep(wait)
-                    # 等待期间新消息到达会更新 _last_arrival，循环重新计算
+            first_check_pass = True
+
+        if not first_check_pass:
+            return
+
+        # 防抖等待（锁外）：期间新消息到达可自由更新 _last_arrival
+        while True:
+            async with self._lock:
+                last = self._last_arrival.get(sid, 0.0)
+            wait = self.merge_window_seconds - (time.time() - last)
+            if wait <= 0:
+                break
+            self._log(sid, f"防抖等待 {wait:.1f}s（窗口 {self.merge_window_seconds}s）")
+            await asyncio.sleep(min(wait, 0.5))
+            # 每次唤醒后重新计算，等待期间新消息到达会更新 _last_arrival
+
+        # 第二次检查（锁内）：防抖期间 inflight 可能已被 tick 路径处理
+        to_publish = None
+        async with self._lock:
+            if self._inflight.get(sid) != done_event_id:
+                self._log(sid, f"防抖后 in-flight 已变更，跳过: {done_event_id}")
+                return
             to_publish = self._decide_and_apply_locked(sid)
+
         if to_publish is not None:
             n_msgs = len(to_publish.messages)
             self._log(sid, f"发布批次 {to_publish.event_id}（{n_msgs} 条消息，来自 {len(to_publish.extra.get('merged_from', []))} 个来源）")
