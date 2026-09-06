@@ -231,6 +231,7 @@ class DebouncePlugin(BasePlugin):
         # 额外信号（user_msgs/session_msgs 群聊+私聊开关与参数；bot_speech 仅群聊）
         _detect = cfg.get("section_detect", {}) or {}
         for _k in ("detect_user_msgs", "detect_session_msgs", "detect_bot_speech",
+                   "bot_speech_block_session",
                    "dm_detect_user_msgs", "dm_detect_session_msgs"):
             if _k in _detect:
                 _enhance_cfg[_k] = _detect[_k]
@@ -240,7 +241,7 @@ class DebouncePlugin(BasePlugin):
                    "bot_speech_window_seconds", "bot_speech_threshold",
                    "dm_user_msgs_window_seconds", "dm_user_msgs_threshold",
                    "dm_session_msgs_window_seconds", "dm_session_msgs_threshold",
-                   "extra_default_duration"):
+                   "extra_default_duration", "extra_max_duration", "extra_allow_bot_duration"):
             if _k in _th:
                 _enhance_cfg[_k] = _th[_k]
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
@@ -400,7 +401,7 @@ class DebouncePlugin(BasePlugin):
             dur = params.get("properties", {}).get("duration")
             if isinstance(dur, dict):
                 dur["description"] = (
-                    f"屏蔽时长（秒）。留空/0=用默认时长（当前配置 {default_d} 秒）；-1 表示永久"
+                    f"屏蔽时长（秒）。留空/0=用默认时长（当前配置 {default_d} 秒）；-1 表示永久（未设最大时长限制时；有上限则按最大允许值）"
                 )
         except Exception:
             pass
@@ -444,11 +445,11 @@ class DebouncePlugin(BasePlugin):
                 logger.info(f"[Enhance] 主动续窗: {result}")
         return []
 
-    @register.tag(name="poke_ignore", description="屏蔽戳一戳骚扰。输出 <poke_ignore>user|duration:N</poke_ignore> 屏蔽目标用户，<poke_ignore>all|duration:N</poke_ignore> 屏蔽所有用户，<poke_ignore>none</poke_ignore> 不屏蔽。duration 为秒，留空用默认值。")
+    @register.tag(name="poke_ignore", description="屏蔽戳一戳骚扰。输出 <poke_ignore>user|duration:N</poke_ignore> 屏蔽目标用户，<poke_ignore>all|duration:N</poke_ignore> 屏蔽所有用户，<poke_ignore>none</poke_ignore> 不屏蔽。duration 为秒，留空用默认值，-1 表示永久（未设最大时长限制时；有上限则按最大允许值）。")
     async def handle_poke_ignore(self, value: str, **kwargs) -> list:
         return self._apply_ignore_tag("poke", value)
 
-    @register.tag(name="ignore", description="拉黑用户：屏蔽后该用户/会话的所有消息不再进入（含戳一戳/at/关键词/引用/刷屏）。输出 <ignore>user|duration:N</ignore> 拉黑目标用户，<ignore>all|duration:N</ignore> 拉黑所有用户，<ignore>none</ignore> 不屏蔽。duration 为秒，留空用默认值。")
+    @register.tag(name="ignore", description="拉黑用户：屏蔽后该用户/会话的所有消息不再进入（含戳一戳/at/关键词/引用/刷屏）。输出 <ignore>user|duration:N</ignore> 拉黑目标用户，<ignore>all|duration:N</ignore> 拉黑所有用户，<ignore>none</ignore> 不屏蔽。duration 为秒，留空用默认值，-1 表示永久（未设最大时长限制时；有上限则按最大允许值）。")
     async def handle_ignore(self, value: str, **kwargs) -> list:
         return self._apply_ignore_tag("all", value)
 
@@ -493,7 +494,7 @@ class DebouncePlugin(BasePlugin):
                 },
                 "duration": {
                     "type": "integer",
-                    "description": "屏蔽时长（秒）。留空用默认值；-1 表示永久",
+                    "description": "屏蔽时长（秒）。留空用默认值；-1 表示永久（未设最大时长限制时；有上限则按最大允许值）",
                     "default": 0,
                 },
             },
