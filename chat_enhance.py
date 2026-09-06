@@ -180,6 +180,12 @@ class HarassDetector:
     def __init__(self, cfg: dict, plugin):
         self._plugin = plugin
         self._load(cfg)
+        # 额外信号独立配置（user_msgs/bot_speech/session_msgs 不再兜落 poke 配置）
+        self._extra_conf = {
+            "allow_bot_duration": bool(cfg.get("extra_allow_bot_duration", True)),
+            "max_duration": _safe_int(cfg.get("extra_max_duration"), 300),
+            "default_duration": _safe_int(cfg.get("extra_default_duration"), 180),
+        }
         # 作用域/白名单（全局，所有类型共用）：
         # scope_sessions 非空时仅对这些会话检测（空=全部）；白名单命中不检测
         self._scope_sessions = set(str(x) for x in (cfg.get("harass_scope_sessions") or []))
@@ -272,7 +278,13 @@ class HarassDetector:
         与 is_ignored 的区别：is_ignored 按 kind 精确匹配（检测跳过用）；
         is_blocked 不看 kind——只要该用户/会话被屏蔽过（无论 poke/at/keyword/
         reply 还是额外信号），其消息就完全不进 LLM（宿主 handle_msg 入口调用）。
+
+        白名单豁免：harass_whitelist_users / harass_whitelist_sessions 中的用户/会话
+        不受任何屏蔽影响（消息照常进入 LLM）。
         """
+        # 白名单豁免（先于屏蔽检查）
+        if user_id in self._whitelist_users or sid in self._whitelist_sessions:
+            return False
         for (s, uid, kind), until in self._ignored.items():
             if until <= now:
                 continue
@@ -287,11 +299,24 @@ class HarassDetector:
     def apply_ignore(self, sid: str, user_id: str, kind: str, duration: int) -> str:
         """执行屏蔽。user_id='*' 表示该会话内所有用户；sid='*' 表示全局（所有会话）。
         kind='all' 时展开为全部 4 类（poke/at/keyword/reply）。返回结果文本。"""
-        # kind='all' 时用任一具体 kind 的配置（默认时长/钳制）
-        conf = self._conf.get(kind) or self._conf.get("poke", {})
+        # kind='all' 时用任一具体 kind 的配置（默认时长/钳制）；
+        # 额外信号（user_msgs/bot_speech/session_msgs）用独立 extra 配置（默认时长/钳制）
+        if kind in ("user_msgs", "bot_speech", "session_msgs"):
+            conf = self._extra_conf
+        else:
+            conf = self._conf.get(kind) or self._conf.get("poke", {})
         if duration < 0:
-            # -1 = 永久屏蔽（工具描述约定）
-            until = float("inf")
+            # -1 = 永久屏蔽——但有最大时长限制时不允许永久：
+            # "-1 意为无限"，被钳到最大允许值；未启用上限（max<=0）才真正永久。
+            # allow_bot_duration=False（bot 不允许自设时长）时 -1 同样无效，按默认时长。
+            if not conf.get("allow_bot_duration", True):
+                duration = conf.get("default_duration", 180)
+                until = time.time() + duration
+            elif conf.get("max_duration", 0) > 0:
+                duration = conf["max_duration"]
+                until = time.time() + duration
+            else:
+                until = float("inf")
         else:
             # allow_bot_duration=False：bot 不允许自设时长，强制用默认时长
             # （配置语义：仅允许使用默认屏蔽时长，忽略 bot 建议值）
@@ -683,6 +708,11 @@ class ChatEnhanceEngine:
         self.dm_presence = PresenceThrottle(_dm_cfg) if self.dm_presence_enabled else self.presence
         self.mentioned_dm_score_gate_deny = bool(cfg.get("mentioned_dm_score_gate_deny", False))
         self.mentioned_dm_score_gate_boost = bool(cfg.get("mentioned_dm_score_gate_boost", False))
+        # 额外信号独立配置注入（HarassDetector.apply_ignore 特判用）
+        cfg = dict(cfg)
+        cfg["extra_allow_bot_duration"] = bool(cfg.get("extra_allow_bot_duration", True))
+        cfg["extra_max_duration"] = _safe_int(cfg.get("extra_max_duration"), 300)
+        cfg["extra_default_duration"] = _safe_int(cfg.get("extra_default_duration"), 180)
         self.harass = HarassDetector(cfg, plugin)
         self.dormant = DormantState(cfg)
         self.merger = NoticeMerger(plugin, merge_seconds)
@@ -718,6 +748,11 @@ class ChatEnhanceEngine:
         self.bot_speech_threshold = _safe_int(cfg.get("bot_speech_threshold"), 10)
         # 额外信号默认屏蔽时长（通知里建议 bot 使用的 duration；独立于各骚扰类别的 default_duration）
         self.extra_default_duration = _safe_int(cfg.get("extra_default_duration"), 180)
+        # 额外信号独立钳制配置（不再兜落 poke 配置）
+        self.extra_allow_bot_duration = bool(cfg.get("extra_allow_bot_duration", True))
+        self.extra_max_duration = _safe_int(cfg.get("extra_max_duration"), 300)
+        # bot_speech 检测后：通知教会话级拉黑标签（输入=拉黑当前会话）；关闭则仅提醒
+        self.bot_speech_block_session = bool(cfg.get("bot_speech_block_session", True))
         self._extra_counts: dict[str, dict[str, deque]] = defaultdict(
             lambda: {k: deque(maxlen=512) for k in ("bot_speech", "user_msgs", "session_msgs")}
         )
@@ -768,19 +803,31 @@ class ChatEnhanceEngine:
     # ---- 消息入口（宿主 handle_msg 调用） ----
 
     def _build_extra_notice(self, kind: str, user_id: str, n: int, window: float, threshold: int) -> str:
-        """额外信号通知：user_msgs（单用户消息条数）/ session_msgs（会话消息条数）。
-
-        带两种拉黑选项：定向屏蔽该信号（<ignore>user:{uid}|type:{kind}|...</ignore>）
-        或全拉黑该用户（<ignore>user:{uid}|duration:...</ignore>）——bot 可主动拉黑。
+        """额外信号通知。时长建议动态取配置允许的最大值（extra_max_duration，未启钳制时
+        回落 extra_default_duration）；不教 -1（永久仅在 hint 中说明，避免绕过钳制）。
+        bot_speech 且 bot_speech_block_session 开启：建议会话级拉黑标签（<ignore>all|...>），
+        输入即拉黑当前会话；关闭则仅提醒。user_msgs/session_msgs 仍教定向/全拉黑两选项。
         """
         label = {"user_msgs": f"user {user_id} sent", "session_msgs": "this session received",
                  "bot_speech": "you spoke"}[kind]
-        dur = self.extra_default_duration
+        dur = self.extra_max_duration if self.extra_max_duration > 0 else self.extra_default_duration
+        if kind == "bot_speech":
+            if self.bot_speech_block_session:
+                return (
+                    f"[System: you spoke {n} messages in {int(window)}s (threshold {threshold}). "
+                    f"Reply with <ignore>all|duration:{dur}</ignore> to block this session "
+                    f"(all messages stop entering the LLM, restore after {dur}s), "
+                    f"or <ignore>none</ignore> to do nothing.]"
+                )
+            return (
+                f"[System: you spoke {n} messages in {int(window)}s (threshold {threshold}). "
+                f"Consider slowing down and only reply when mentioned.]"
+            )
         return (
             f"[System: {label} {n} messages in {int(window)}s (threshold {threshold}). "
             f"Reply with <ignore>user:{user_id}|type:{kind}|duration:{dur}</ignore> to block "
             f"this user\'s {kind}, or <ignore>user:{user_id}|duration:{dur}</ignore> to fully "
-            f"block, or <ignore>none</ignore> to do nothing. Ignore lasts {dur}s by default.]"
+            f"block, or <ignore>none</ignore> to do nothing. Ignore lasts {dur}s (max allowed).]"
         )
 
     def on_im_message(self, event) -> None:
