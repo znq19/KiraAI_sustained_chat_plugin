@@ -731,6 +731,12 @@
         "type": "boolean",
         "default": true,
         "hint": "检测到并行识图插件（parallel_image_reader）启用时自动将其禁用，图片识别完全由本模块接管（本模块已覆盖其并行 VLM、缓存、限流能力且支持语音）。关闭后保留旧行为：图片归 PIR、本模块只做音频（不推荐，PIR 会替换媒体元素导致表情包复读失效）。"
+      },
+      "guard_framework_vlm": {
+        "name": "避免重复识图（省 token）",
+        "type": "boolean",
+        "default": true,
+        "hint": "避免触发原有 VLM 重复识别、浪费 token。默认开，如确有兼容需要可关闭。"
       }
     }
   },

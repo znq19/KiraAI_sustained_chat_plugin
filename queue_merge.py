@@ -35,6 +35,64 @@ from core.chat.message_elements import Image, Sticker, Record
 from core.provider import LLMResponse
 
 
+class BufferedMsgShim:
+    """把批次里的 KiraIMMessage 包装成与「缓冲中 KiraMessageEvent」相同的访问形状
+    （``.message`` / ``.message_types`` / ``.adapter`` / ``.session`` / ``.is_group_message()``），
+    使"从批次还原回会话缓冲"的消息与正常入队消息对后续 flush 完全等价。
+
+    框架 flush_session_messages 只从缓冲元素上取这四个属性
+    （``messages=[m.message for m in pending]``，adapter/session/message_types 取最后一条，
+    见 core/message_manager.py 的 flush_session_messages），故 shim 足够。
+    与 Midflight 插件的同名 shim 保持完全一致。
+
+    ⚠ 为什么需要它：批次是在框架 flush 时由 ``buffer.flush()`` 生成的（消息已被弹出缓冲），
+    任何"掐掉批次"的插件如果不把消息还原回缓冲，就等于把它们彻底丢掉
+    （既不会进 LLM、也不在缓冲里，之后任何一轮都看不到）。
+    """
+
+    __slots__ = ("message", "message_types", "adapter", "session", "_is_group")
+
+    def __init__(self, message, batch_event):
+        self.message = message
+        self.message_types = getattr(batch_event, "message_types", None)
+        self.adapter = getattr(batch_event, "adapter", None)
+        self.session = getattr(batch_event, "session", None)
+        try:
+            self._is_group = bool(batch_event.is_group_message())
+        except Exception:
+            self._is_group = getattr(message, "group", None) is not None
+
+    def is_group_message(self):
+        return self._is_group
+
+
+def restore_messages_to_buffer(ctx, sid: str, messages: list, batch_event=None) -> int:
+    """把批次里的消息原样放回会话缓冲**头部**（保持顺序），返回还原条数。
+
+    还原后由既有「前文」机制接管：调用方随后会 ``event.stop()``（本批不进 LLM），
+    而插件侧 ``batch_started`` 已清 ⇒ ``_debounce_loop`` 的保险丝不会 flush，
+    要等下次真实唤醒把「前文 + 唤醒批次」一起送出 —— 语义正是"只当上下文看，
+    不引起回复"，与旧版"整批丢掉"相比只是不再丢内容。
+
+    失败（拿不到 buffer 等）返回 0，由调用方决定是否仍要 stop。
+    """
+    msgs = [m for m in (messages or []) if m is not None]
+    if not msgs or not sid:
+        return 0
+    try:
+        buf = ctx.get_buffer(sid)
+    except Exception:
+        return 0
+    if buf is None:
+        return 0
+    try:
+        buf.buffer[:0] = [BufferedMsgShim(m, batch_event) for m in msgs]
+        return len(msgs)
+    except Exception:
+        logger.exception("[QueueMerge] 批次消息还原回缓冲失败（这批消息会丢）")
+        return 0
+
+
 @dataclass
 class PendingBatch:
     """待推送批次（记录进入 pending 的时刻，用于超时合并判定）"""
@@ -110,6 +168,9 @@ class BatchMergeScheduler:
 
         # per-sid 状态
         self._inflight: dict[str, str] = {}          # sid -> event_id（当前正在处理的批次）
+        # sid -> 该批次的事件对象：用来判断"这一轮是不是已经被停掉/结束了"
+        # （事件被 stop() 之后框架不会再有任何收尾事件 → 不能傻等 stall 兜底）
+        self._inflight_event: dict[str, object] = {}
         self._inflight_since: dict[str, float] = {}  # sid -> 最近一次 LLM 活动时间（卡死兜底用）
         self._final_marked: set[str] = set()         # 该 sid 的 in-flight 批次已进入最后一步
         self._pending: dict[str, list[PendingBatch]] = {}   # sid -> 待推送队列
@@ -137,6 +198,7 @@ class BatchMergeScheduler:
             # 外部批次（core trigger/flush 创建）extra 默认 None，判空后再取标记（与 S 版对齐）
             if event.extra and event.extra.get("_qm_self"):
                 self._inflight[sid] = event.event_id
+                self._inflight_event[sid] = event
                 self._inflight_since[sid] = time.time()
                 self._log(sid, f"自发布批次 {event.event_id} 直接放行（_qm_self）")
                 return
@@ -160,6 +222,7 @@ class BatchMergeScheduler:
             else:
                 # 空闲 -> 放行
                 self._inflight[sid] = event.event_id
+                self._inflight_event[sid] = event
                 self._inflight_since[sid] = time.time()
                 self._log(sid, f"放行批次 {event.event_id}")
 
@@ -195,10 +258,27 @@ class BatchMergeScheduler:
         need_push = False
         async with self._lock:
             # 锁内只判定；真正的二次校验在 _push_pending 锁内再做（双保险）
-            if self._inflight.get(sid) == event.event_id and sid in self._final_marked:
+            # 本轮被谁 stop() 了（停止词 / 其它插件掐停）：框架此后**不会**再有
+            # ON_LLM_RESPONSE 或工具边界，_final_marked 永远不会置位 —— 不能傻等
+            # inflight_stall_timeout（默认约 180s），当场就推 pending。
+            if self._inflight.get(sid) == event.event_id and (
+                    sid in self._final_marked or self._is_stopped(event)):
                 need_push = True
         if need_push:
             await self._push_pending(sid, event.event_id)
+
+    @staticmethod
+    def _is_stopped(event) -> bool:
+        """该批次事件是否已经被 stop()（= 这一轮不会再有任何收尾事件）。
+
+        框架的钩子循环/消费者只看 `event.is_stopped` 就 break，被停掉的那一轮不会再有
+        ON_LLM_RESPONSE / ON_TOOL_RESULT / ON_STEP_RESULT —— 单靠 _final_marked 判断
+        "已收尾"会让 in-flight 一直挂着，pending 只能等 stall 兜底（默认约 180s）。
+        """
+        try:
+            return bool(getattr(event, "is_stopped", False))
+        except Exception:
+            return False
 
     def _is_last_step(self, resp: LLMResponse) -> bool:
         """agent_step_index 是否已达最大步数（框架最后一步）。
@@ -237,6 +317,7 @@ class BatchMergeScheduler:
         """三分支推送决策（须持有 _lock）：返回要发布的合并批次，状态已更新。"""
         pending = self._pending.pop(sid, [])
         self._inflight.pop(sid, None)
+        self._inflight_event.pop(sid, None)
         self._inflight_since.pop(sid, None)
         self._final_marked.discard(sid)
         if not pending:
@@ -268,24 +349,31 @@ class BatchMergeScheduler:
             self._pending.pop(sid, None)
         merged = self._build_merged_batch(to_merge)
         self._inflight[sid] = merged.event_id
+        self._inflight_event[sid] = merged
         self._inflight_since[sid] = time.time()
         return merged
 
     async def drop_sustain_pending(self, sid: str, hit_ids) -> int:
-        """丢弃 pending 中「仅由持续命中消息触发」的批次（持续对话停窗时调用）。
+        """把 pending 中「仅由持续命中消息触发」的批次**退成前文**（持续对话停窗时调用）。
 
         判定：批次内所有 mentioned 消息的 message_id 都在 hit_ids 中 → 该批次的
-        触发完全来自持续命中，丢弃；含真实唤醒消息（@/唤醒词/引用回复，mentioned
-        但不在 hit_ids）或不含任何 mentioned 消息的批次一律保留不动。
+        触发完全来自持续命中，不应在 AI 已终止本轮后再引起一次回复；
+        含真实唤醒消息（@/唤醒词/引用回复，mentioned 但不在 hit_ids）或不含任何
+        mentioned 消息的批次一律保留不动。
 
-        注意（2026-09 核对）：框架 flush 时已把消息从会话缓冲弹出，本方法只丢弃
-        待推送批次、**不会**把消息放回缓冲 ⇒ 这批消息既不会进 LLM、也不会进后续
-        上下文。因此必须同步取消它们的媒体预取（否则预取的 VLM 纯属白烧）。
+        ⚠ 与旧实现的关键区别：这些批次的**消息**已经被框架 flush 出会话缓冲
+        （flush_session_messages → buffer.flush() 弹出全部）——旧实现只丢弃批次，
+        等于把这批消息**直接丢掉**（既不会进 LLM、也不会进后续上下文，旧注释已承认）。
+        现在改为：批次照旧不进 LLM（不引起回复），但批次里的消息**原样放回会话缓冲头部**
+        → 退成「前文」，随下次真实唤醒一起送进 LLM。因此也**不再取消媒体预取**
+        （这批会进上下文，识别结果依然有用；结果按 md5 进缓存，不会白烧）。
+
         只动 pending，不触碰 _inflight / _final_marked，不影响推送决策状态机。
-        返回丢弃批次数。
+        返回处理的批次数。
         """
         if not hit_ids:
             return 0
+        to_restore: list[tuple] = []      # [(batch_event, [msgs])]
         async with self._lock:
             pending = self._pending.get(sid)
             if not pending:
@@ -297,16 +385,8 @@ class BatchMergeScheduler:
                 mentioned = [m for m in msgs if getattr(m, "is_mentioned", False)]
                 if mentioned and all(getattr(m, "message_id", None) in hit_ids for m in mentioned):
                     dropped += 1
-                    self._log(sid, f"停窗丢弃持续命中积压批次 {pb.batch.event_id}（{len(msgs)} 条）")
-                    # 这批不会进 LLM 了 → 取消它的媒体预取，别再烧 VLM
-                    try:
-                        rec = getattr(self, "media_recognizer", None)
-                        if rec is not None:
-                            n = rec.cancel_prefetch(rec.collect_prefetch_ids(msgs))
-                            if n:
-                                self._log(sid, f"同步取消 {n} 个在飞媒体预取（该批已丢弃）")
-                    except Exception as e:
-                        self._log(sid, f"取消预取失败：{type(e).__name__}: {e}")
+                    to_restore.append((pb.batch, msgs))
+                    self._log(sid, f"停窗积压批次 {pb.batch.event_id} 的 {len(msgs)} 条消息转前文（不回一轮）")
                 else:
                     kept.append(pb)
             if dropped:
@@ -314,7 +394,10 @@ class BatchMergeScheduler:
                     self._pending[sid] = kept
                 else:
                     self._pending.pop(sid, None)
-            return dropped
+        # 锁外还原（与 _push_pending 的"锁内决策、锁外发布"同范式）
+        for batch_event, msgs in to_restore:
+            restore_messages_to_buffer(self.ctx, sid, msgs, batch_event)
+        return dropped
 
     # ================= 阈值防护 =================
 
@@ -431,7 +514,11 @@ class BatchMergeScheduler:
                 if not pending:
                     continue
                 inflight = self._inflight.get(sid)
-                if inflight and sid not in self._final_marked:
+                if inflight and self._is_stopped(self._inflight_event.get(sid)):
+                    # 本轮已经被停掉（停止词 / 其它插件掐停）：不会再有任何收尾事件，
+                    # 不必等 stall 兜底，直接走下面的推送决策
+                    self._log(sid, "in-flight 已被 stop，不等 stall 直接推送 pending")
+                elif inflight and sid not in self._final_marked:
                     # in-flight 仍在处理（未到最后一步）
                     # 卡死判定：自最后一次 LLM 活动（on_llm_response 心跳，含工具中间步）
                     # 起超过 inflight_stall_timeout 仍无动静 —— LLM 挂起/任务崩溃/被其他插件
@@ -482,6 +569,7 @@ class BatchMergeScheduler:
                     self._log(sid, f"shutdown 重发 pending 批次 {pb.batch.event_id}")
             self._pending.clear()
             self._inflight.clear()
+            self._inflight_event.clear()
             self._inflight_since.clear()
             self._final_marked.clear()
         if task and not task.done():

@@ -285,7 +285,7 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 | `section_dm_sustain` | 私聊持续对话 + **私聊独立存在感节流参数** + **评分补正/概率调节开关** |
 | `section_scheduled` | 定时主动任务（间隔/Cron、会话列表、工具黑名单、提示词） |
 | `section_queue_merge` | 队列合并/积压处理（积压批次合并推送，更省 token） |
-| `section_media_recognition` | 并行媒体识别（图片 VLM + 语音 STT 并行预处理，回复更快） |
+| `section_media_recognition` | 并行媒体识别（图片 VLM + 语音 STT 并行预处理，回复更快）；内含**避免重复识图（省 token）**开关：避免触发原有 VLM 重复识别、浪费 token，默认开，如确有兼容需要可关闭 |
 | `section_presence` | 存在感节流 + **提及消息评分（群聊/私聊）** |
 | `section_poke` / `section_at` / `section_keyword` / `section_reply` | 骚扰感知化（戳/at/关键词/引用检测 + XML 决策屏蔽） |
 | `section_dormant` | 休眠时段（起夜概率 + 维持期 + 主动续窗限制） |
@@ -353,6 +353,21 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.5.16
+- **新增「官方 VLM 保护网」**（`guard_framework_vlm`，默认开）：框架自己那条付费识图链路被彻底堵住
+  - **问题**：官方 VLM 全项目只有一个触发条件 —— `ele.caption is None`，而它的**渲染发生在所有批次钩子之前**（`message_manager.handle_im_batch_message` 先渲染批次、后派发 `ON_IM_BATCH_MESSAGE`）。也就是说 QueueMerge 的拦截、Midflight 的拦截、本模块 stage2/stage3 的抢救**全都发生在"钱已经花掉"之后**。只要有一条消息的图片没被预置 caption（第三方插件抢先 `stop()`、钩子顺序异常、stage1 异常……），官方就会付费识图，**事后无法挽回**（日志表现为突然冒出 `[llm] Describing image using …`）
+  - **修复**：新增最早执行的钩子（`on.im_message` **SYS_HIGH**，早于所有 HIGH 钩子）`guard_captions()` —— 只做一件事：把链上 `caption is None` 的图片/表情**占成空串**（官方空占位 `[Image ]` / `[Sticker ]`）
+  - **只占位，不做别的**：不暂存 `_pir_media`、不预取、不发起任何识别、不改任何消息策略（不 buffer/discard/stop）、不删不换元素；识别仍由 `handle_msg` + stage1 在 HIGH 按「仅唤醒识别/概率/超限」决定，**省 VLM 语义完全不变**；只在 caption **是 None** 时写 `""`，**绝不覆盖已有描述**；PIR 接管图片 / 原生多模态模式下一律不碰（与 stage1 跳过条件一致）；「启用并行媒体识别」关闭时不生效（那种配置下本来就该由框架识图）
+  - **兼容性**：框架里 `caption is None` 只用在官方识图那一个判断上；本插件全程用 `(caption or "")`，**空串与 None 完全等价** ⇒ 自己的行为零变化。唯一影响：依赖「`caption is None` = 框架还没识图」这一信号的第三方插件，会看到该字段被提前占位（关掉本开关即可恢复原状）
+- **修复「bot 自己发的图/表情被当成识别对象」**：框架的钩子循环**只在 `stop()` 时中断，`discard()` 不中断**（`core/message_manager.py`），所以宿主按"机器人自身消息"`discard()` 之后，stage1 **照样会执行**——把 bot 自己那条消息里的图片/表情设成待识别并登记进本回合暂存索引。而 stage3 判断"这条媒体在不在请求里"用的是**文本锚点**，官方空占位的锚点是**通配**的（`Sticker` 是 `[Sticker ]`，无路径无 id；`Image` 落盘失败是 `[Image ]`）⇒ 只要请求里存在任意一个未识别表情包的空占位，暂存索引里**所有** caption 为空的表情包都会被命中，**包括 bot 自己那张**：白跑一次 VLM，还会把它的描述与 `file_path` 填进**用户那张**的空占位（张冠李戴）
+  - **修复**：stage3 抢救新增**准入条件** `_batch_media_ids(event)` —— 只有**元素确实出现在本批次消息链里**（键与 stage1 同源，取 `elem._pir_short_id`）的媒体才允许被抢救；通配文本锚点不再能单独作为"这条在请求里"的证据
+- **修复「停窗后持续命中批次被整批掐掉 ⇒ 消息直接丢失」**：`_stop_sustain_round()`（AI 空消息 / AI 停止词 / 用户停止词 / 达上限）之后迟到的「纯持续命中」批次，会在两处被处理 —— ① `on_queue_merge_batch` 里**静默** `event.stop()`（debug 级日志）；② `QueueMerge.drop_sustain_pending()` 丢弃 pending 里的同类批次
+  - **问题**：这两处的批次，消息**已经被框架 flush 出会话缓冲**（`flush_session_messages` 会先 `buffer.flush()` 把缓冲弹空）⇒ 只掐不还原就等于**彻底丢消息**：既不会进 LLM、也不在缓冲里，**之后任何一轮都看不到**。`_stop_sustain_round` 注释写的"消息仍在缓冲，上下文不丢"只对**还没 flush** 的批次成立，`_debounce_loop` 的保险丝挡不住"已满即推 / 顺延到点已经 flush"的那些（旧版 `drop_sustain_pending` 的注释其实自己也承认了这一点）
+  - **修复**：语义**不变**（仍然不回一轮），但把批次里的消息**原样放回会话缓冲头部**（新增 `restore_messages_to_buffer()`，shim 形状与缓冲内 `KiraMessageEvent` 完全一致）→ 退成「前文」，等下次真实唤醒随批次一起送进 LLM。`drop_sustain_pending()` 同样改为「摘掉批次 + 还原消息」，并**不再取消媒体预取**（这批会进上下文，识别结果依然有用）
+  - **举例**：群里 bot 回了空消息 ⇒ 停窗；用户接着说"明天我要请假" ⇒ 旧版这句从上下文里消失（下次有人 @bot 时它完全不知道），现在这句留在前文里，下次唤醒时 bot 看得到
+  - 只影响 S 版（Z 版没有持续对话）；`queue_merge.py` 两版保持逐字节一致
+- 版本 v2.5.15 → v2.5.16
 
 ### v2.5.15
 - **修复「第三方插件重建的媒体副本」触发官方 VLM（付费）**：会话合并 / 上下文压缩类插件在 `on_llm_request` 用历史重建请求时，会把被回复消息的媒体**重新下载成另一个临时文件**（`download_10.jpg` → `download_11.jpg`）——此刻链上已无对应元素，空占位只以**文本**形式嵌在 `Reply.content` 里，元素级兜底拿不到元素 → 框架 `if ele.caption is None` 成立 → 官方 VLM 付费调用

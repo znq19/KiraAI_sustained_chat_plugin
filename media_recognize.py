@@ -85,6 +85,12 @@ class ParallelMediaRecognizer:
         # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
         # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
         self.pir_auto_disable = bool(sec.get("pir_auto_disable", True))
+        # 官方 VLM 保护网（guard_framework_vlm，默认开）：见 guard_captions()。
+        # 目的只有一个 —— 把「官方 VLM 唯一触发条件 `ele.caption is None`」提前堵掉：
+        # 框架的渲染发生在所有批次钩子之前，一旦某条消息的图片没被预置 caption，
+        # 官方就会付费识图，事后无法挽回。关掉即恢复"框架自己识图"的原始行为
+        # （配合 bot_config.capabilities.image_recognition.enabled 一起用）。
+        self.guard_enabled = bool(sec.get("guard_framework_vlm", True))
         # ── 预取池（真·预处理）────────────────────────────────────────────
         # 场景：消息已确定进入批次，而上一个批次的 LLM 还在跑 / 本批次还在队列里排队。
         # 这段空窗不该浪费 —— 立刻在后台把 VLM/STT 跑掉；放行时 stage2 直接命中结果，
@@ -316,6 +322,55 @@ class ParallelMediaRecognizer:
                         i += len(expanded) - 1
             i += 1
         stack.remove(cid)
+
+    async def guard_captions(self, event: KiraMessageEvent) -> int:
+        """官方 VLM 保护网（最早执行，只做一件事：把 caption 从 None 占住）。
+
+        背景：框架的官方 VLM 全项目**只有两个触发点**，条件都是 `ele.caption is None`
+        （core/message_manager.py 的 Image / Sticker 分支），而它的渲染发生在
+        **所有批次钩子之前**：
+
+            for message in event.messages:                      # ← 先渲染（可能付费识图）
+                message_str = await self.message_format_to_text(...)
+            for handler in ON_IM_BATCH_MESSAGE handlers: ...     # ← 插件层才轮到
+
+        也就是说：QueueMerge/Midflight 的拦截、本模块 stage2/stage3 的抢救，全都发生在
+        "钱已经花掉"之后 —— 插件唯一能阻止官方 VLM 的位置，就是**消息刚到达时**把
+        caption 预先占住。stage1 本来就在做这件事，但它跑在 handle_msg 之后（HIGH），
+        且会被更早的钩子 stop 掉；一旦漏掉一条，官方就会付费识图，事后无法挽回。
+
+        因此本方法在 SYS_HIGH（比所有 HIGH 钩子都早）做一次**纯占位**：
+        caption is None → caption = ""（即官方空占位 `[Image ]` / `[Sticker ]`）。
+
+        刻意不做的事（保证对其它插件零影响）：
+          · 不暂存 _pir_media、不预取、不发起任何识别 —— 识别仍由 handle_msg + stage1
+            按"仅唤醒识别/概率/超限"决定，省 VLM 的语义完全不变；
+          · 不改任何消息策略（不 buffer/discard/stop），不删不换元素；
+          · 只在 caption **是 None** 时写 ""，绝不覆盖已有描述；
+          · PIR 接管图片 / 原生多模态模式下一律不碰（与 stage1 的跳过条件一致）；
+          · 本模块整体关闭（section_media_recognition.enabled=false）时不做，
+            这种配置下"框架自己识图"本来就是期望行为。
+
+        返回值 = 占位的媒体个数（供测试/日志用）。
+        """
+        if not self.enabled or not self.guard_enabled:
+            return 0
+        try:
+            sid = getattr(getattr(event, "session", None), "sid", None)
+            # 与 stage1 保持同一套"谁负责图片"的判定：PIR 接管 / native 直传时不插手
+            if self._pir_active() or self._native_mode(sid):
+                return 0
+            n = 0
+            for elem in self._iter_media_elems(getattr(getattr(event, "message", None), "chain", None)):
+                try:
+                    if getattr(elem, "caption", None) is None:
+                        elem.caption = ""
+                        n += 1
+                except Exception:
+                    continue
+            return n
+        except Exception:
+            return 0
 
     async def on_im_message(self, event: KiraMessageEvent, *_):
         """ON_IM_MESSAGE：先拍平嵌套 Forward（防核心渲染丢内容），再处理媒体。
@@ -635,6 +690,21 @@ class ParallelMediaRecognizer:
                     for sub in (getattr(ele, "chains", None) or []):
                         yield from _walk(sub)
         yield from _walk(chain)
+
+    def _batch_media_ids(self, event) -> set:
+        """本批次消息链里**实际存在**的媒体 id 集合（stage3 抢救的准入条件）。
+
+        键与 stage1 一致（`elem._pir_short_id`，stage1 在 _prefill_media /
+        _replace_media 里钉在元素上）。用它而不是文本锚点来判定「这条媒体在不在
+        这次请求里」——官方空占位的锚点是通配的（见 on_llm_request ① 处注释）。
+        """
+        ids = set()
+        for m in (getattr(event, "messages", None) or []):
+            for elem in self._iter_media_elems(getattr(m, "chain", None)):
+                sid_ = getattr(elem, "_pir_short_id", None)
+                if sid_:
+                    ids.add(sid_)
+        return ids
 
     # ============ 预取（真·预处理）：排队 / 上一批次还在跑时先识别 ============
 
@@ -966,8 +1036,20 @@ class ParallelMediaRecognizer:
                 return f"[Sticker {_cap}]"
 
             # ① 本会话暂存索引（我方 stage1 认领过的媒体）
+            # 准入条件：**元素必须真的出现在本批次消息链里**。
+            # 暂存索引是按 ON_IM_MESSAGE 事件登记的，里面可能混入**根本不该被识别**的媒体：
+            # 框架的钩子循环只在 stop() 时中断（core/message_manager.py），discard() 不中断，
+            # 所以 bot 自己发出、被适配器回显、宿主已判"丢弃"的消息，stage1 照样会登记它。
+            # 只按文本锚点反查是不安全的：官方空占位里 Sticker 是 "[Sticker ]"、Image 落盘
+            # 失败时是 "[Image ]"，**都是通配的**（无路径也无 id），任意一张未识别媒体都能让
+            # 它们命中 → 会把不在请求里的媒体也送去 VLM（识别了不该识别的对象，并把该媒体
+            # 的描述/路径填进了别的媒体的空占位）。
+            _batch_ids = self._batch_media_ids(event)
             for mid, info in list(round_media.items()):
                 if mid in need or not isinstance(info, dict):
+                    continue
+                if mid not in _batch_ids:
+                    self._log(f"{mid} 不在本批次消息链中（如 bot 自身消息被回显），不参与抢救")
                     continue
                 elem, mtype = info.get("elem"), info.get("type")
                 if elem is None or mtype not in ("Image", "Sticker", "Record"):
