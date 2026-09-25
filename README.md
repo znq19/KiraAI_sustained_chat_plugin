@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.21
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.22
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -353,6 +353,63 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.5.22
+
+- **修复「AI 已是空 msg 却停不了窗」——判据从「整串」改为「可见输出」**
+  - **现象**（用户日志）：bot 已输出空消息，`stop_on_ai_empty` 开着却不停窗，反复重开窗口：
+    ```
+    [message] LLM -> qq:gm:…: <reasoning>
+    …无关消息保持沉默不刷屏，继续空msg。
+    </reasoning>
+    <msg />
+    [plugin] [accel] 一轮结束 … steps=1
+    ```
+  - **根因**：旧判据 `_is_empty_msg` 用
+    `^\s*<msg\s*/>\s*$|^\s*<msg>\s*</msg>\s*$` —— 该正则**本身已正确覆盖两种写法**
+    （自闭合 `<msg />` / 空对 `<msg></msg>`，写法覆盖是刻意设计的），但两个 `^…$` 把
+    **整串原始输出**框死。而本插件默认提示词要求推理写在同级前面
+    （`<reasoning>…</reasoning>`）⇒ 两条分支**同时失配** ⇒ 默认配置下该通路
+    **永不触发**（`steps=1` 证明确实走到了停止判定分支，只是判否）。
+    真只有空 msg 时本来就能停 —— 是前置的伪 reasoning 标签把判据带偏了。
+  - **修复**：`_is_empty_msg` → `is_silent_output`：先用 `visible_output()` 剥掉思考过程，
+    再 `ET.fromstring` **结构化**判断「有没有真的发出东西」，不再堆正则
+    （对属性/嵌套/多段/空白天然正确，不必为每种写法各加一条正则）。
+  - **空 msg 写法覆盖**：原设计两种全部保住，并补齐旧版漏掉的——
+    空白子元素 `<msg><text></text></msg>`、多段全空、空 msg + `<ignore>` 等 root 标签、
+    空响应 `''`、纯空白、以及**任意写法 + 前置 reasoning**。
+  - **口径对齐框架真实产出**：`<text>` 空白**不产出元素**（算空）；
+    其它标签（at/reply/poke/img/record/…）空值**也会真的发出一条消息**
+    （算非空，保守 —— 绝不误停一个其实发出了 at/poke 的轮次）。
+  - **保守边界**：畸形/截断一律判「非静默」（宁可窗口多开一轮，绝不因解析失败误杀窗口，
+    且旧行为也是 False ⇒ 畸形输入零回归）。
+- **同一口径污染停止词（连带修复）**：停止词判定原本也吃含 reasoning 的整串，
+  而默认停止词（不说了 / 不想理 / 晚安 / 再见…）**恰恰最常出现在推理里**
+  （模型在解释「他们道晚安了」「这人我不想理」）⇒ 会**误停**。
+  现改用同一套 `visible_output()`：只看「说了什么」，不看「想了什么」。
+- **接线 bot 发言条数检测（`detect_bot_speech`，防 bot 自己刷屏）**
+  - `ChatEnhanceEngine.on_message_sent` 此前**全仓零调用**（方法存在但没注册钩子），
+    导致该检测**从未生效**（配置页可见、README 未宣传的未完成残留）。
+  - 现注册 `@on.message_sent(priority=LOW)` 转调；**按「条」计数**（设计如此）：
+    一次回复里的每个 `<msg>` 分段各算一条（框架对每个 MessageChain 派发一次
+    ON_MESSAGE_SENT），窗口内达阈值即通知 bot「你说太多了」。
+  - 同时去掉该方法里与 `on_llm_response` **重复**的 `note_bot_reply`：存在感时间线
+    按「轮」记更符合语义，按条再记一次会双倍计数（一次回复发 3 段 = 3 条发送事件）。
+- **静默轮不再被当成一次「bot 发言」**：`enhance.on_llm_response` 原在 `ai_text` 提取
+  **之前**无条件调用，导致 bot 输出空 msg（什么都没发出去）的轮次也被计一次发言
+  （存在感扣分 + 休眠维持期次数 +1）。现移到 `ai_text` 之后并传静默标志，
+  静默轮直接跳过 —— 静默不是发言。
+- **提示词默认值畸形修复**：`dm_proactive_prompt` 的 schema 版含**孤立 `</msg>`**
+  （无开头标签）且与代码版**不一致**；它会被 `Text(...)` 当作**用户消息**发给模型，
+  既是畸形标签样板又泄漏「这是主动触发」。两处统一为合法写法
+  （`直接发送 <msg/> 保持沉默`），并以守护测试锁死一致性。
+- **回归测试** `tests/test_empty_stop.py`（T1~T9，49 断言）：日志原文回归、空 msg
+  多写法全集、非静默不误停、`visible_output` 剥离口径、停止词不读 reasoning、
+  `message_sent` 接线、静默轮不计发言、schema 默认值一致，以及**行为级反向验证**
+  （旧判据在这些用例上 8/8 漏判）。
+  端到端：同一段日志文本，旧代码窗口保持打开（连续次数 2 不变、`stopped` 未置位），
+  新代码 `_stop_sustain_round` 被调用、窗口关闭。
+- 版本 v2.5.21 → v2.5.22
 
 ### v2.5.21
 

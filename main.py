@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import wave
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from typing import Optional, List, Dict, Any
 
@@ -164,7 +165,7 @@ class DebouncePlugin(BasePlugin):
         self.dm_denied_users = dm_sustain.get("dm_denied_users", [])
         self.dm_proactive_prompt = dm_sustain.get(
             "dm_proactive_prompt",
-            "请根据当前对话上下文，自然地主动发送一条消息，可以随意开启新话题或延续之前的聊天。不要提及这是主动触发。"
+            "请根据当前对话上下文，自然地主动发送一条消息，可以随意开启新话题或延续之前的聊天并使用合适的工具；认为互动时机不佳时也可以直接发送 <msg/> 保持沉默。不要提及这是主动触发。"
         )
         # 新增：私聊主动触发的工具黑名单
         self.dm_tool_blacklist = dm_sustain.get("dm_tool_blacklist", [])
@@ -726,9 +727,114 @@ class DebouncePlugin(BasePlugin):
         logger.info(f"[Enhance] 屏蔽(工具): user {target_id} {block_type} {duration}s → {result}")
         return result
 
-    def _is_empty_msg(self, xml: str) -> bool:
-        pattern = r'^\s*<msg\s*/>\s*$|^\s*<msg>\s*</msg>\s*$'
-        return bool(re.match(pattern, xml))
+    # ---- 静默判定（AI 空消息停止） ----
+    #
+    # ★ 历史缺陷（本文件 v2.5.21 及以前）：判据是
+    #       r'^\s*<msg\s*/>\s*$|^\s*<msg>\s*</msg>\s*$'
+    #   它本身**已覆盖两种写法**（自闭合 `<msg />` / 空对 `<msg></msg>`，
+    #   且都允许标签内外空白）——写法覆盖是刻意设计的，没有问题。
+    #   问题在于两个 `^…$` 把**整串原始输出**框死，而本插件默认提示词要求
+    #   推理写在同级前面（`<reasoning>…</reasoning>`），于是：
+    #       <reasoning>…继续空msg。</reasoning>\n<msg />
+    #   两条分支同时失配 ⇒ `stop_on_ai_empty` 在默认配置下**永不触发**，
+    #   bot 明明已经空 msg 却被当作"正常回复"重开窗口，反复循环。
+    #   （真只有空 msg 时本来就能停 —— 是前置标签把判据带偏了。）
+    #
+    #   修法：判据作用对象从「整串」改为「可见输出」——先剥掉思考过程，
+    #   再**结构化**判断有没有真的发出消息。结构化替代正则堆叠，
+    #   对属性/嵌套/多段/空白天然正确（不用再为每种写法加一条正则）。
+    _REASONING_CLOSED = re.compile(
+        r'<\s*reasoning\b[^>]*>.*?<\s*/\s*reasoning\s*>', re.S | re.I)
+    _REASONING_OPEN = re.compile(r'<\s*reasoning\b', re.I)
+    _MSG_ANY = re.compile(r'<\s*msg\b', re.I)
+
+    def visible_output(self, xml: str) -> str:
+        """可见输出 = 去掉「思考过程」后的正文。
+
+        判据必须作用于**模型真正发出去的东西**，而不是"整串原始输出"：
+        reasoning 是"想什么"，不是"说什么"。本方法同时供静默判定与
+        停止词判定使用（两者原本吃同一个整串，被同一个口径带偏）。
+
+        三种形态：
+          · 成对闭合 `<reasoning>…</reasoning>` → 整体剥掉
+          · 未闭合且**后面没有 <msg>**         → 视为截断，剩余全是思考，剥掉
+          · 未闭合但后面**还有 <msg>**         → 模型确实在发消息，保守不剥
+        """
+        t = re.sub(r'<!--.*?-->', '', xml or '', flags=re.S)
+        t = self._REASONING_CLOSED.sub('', t)
+        m = self._REASONING_OPEN.search(t)
+        if m and not self._MSG_ANY.search(t, m.end()):
+            t = t[:m.start()]
+        return t
+
+    @staticmethod
+    def _msg_is_empty(msg_el) -> bool:
+        """一个 <msg> 是否「发不出任何东西」。
+
+        ★ 口径对齐框架真实行为（core/message_manager._parse_xml_msg +
+          builtin_plugins/kira-ai/tags.py）：
+            · <text> 的 handle 是 `if value: return [Text(value)]; return []`
+              ⇒ **空白 <text> 不产出任何元素** ⇒ 视为空；
+            · 其余标签（at/reply/poke/emoji/img/record/selfie/video/forward/
+              sticker）即使 value 为空也 `return [Xxx(value)]`
+              ⇒ **会真的发出一条消息** ⇒ 一律视为**非空**
+              （保守：宁可窗口多开一轮，也绝不误停一个其实发出了 at/poke 的轮次）。
+        """
+        if (msg_el.text or '').strip():
+            return False
+        for c in msg_el:
+            if (c.tail or '').strip():
+                return False
+            if c.tag == 'text':
+                if (c.text or '').strip():
+                    return False
+                continue                      # 空白 <text> 不产出元素
+            return False                      # 其它标签空值也会产出元素 ⇒ 非空
+        return True
+
+    def is_silent_output(self, xml: str) -> bool:
+        """bot 本轮是否**什么都没发出去**（= 静默）⇒ 调用方停窗。
+
+        覆盖的空 msg 写法（原设计的两种 + 补齐的几种）：
+            <msg/>  <msg />  <msg   />           自闭合（标签内空白任意）
+            <msg></msg>  <msg>  </msg>  <msg>\\n</msg>   空对（内部空白/换行）
+            标签外前导/尾随空白
+            <msg><text>\\n</text></msg>          空白子元素
+            <msg/> <msg />                        多段全空
+            <msg/> + <ignore>/<wake_extend>…     空 msg + root 动作标签
+            空响应 '' / 纯空白
+            <reasoning>…</reasoning> + 以上任意   **本次修复的核心场景**
+
+        ⚠ 畸形一律返回 False（保守）：宁可窗口多开一轮，也绝不因解析失败
+          误杀窗口。旧行为也是 False ⇒ 畸形输入零行为回归。
+
+        ⚠ **触发面刻意收窄**：只认「有 <msg> 且全为空」。没有任何 <msg> 的响应
+          （纯 root 动作标签 / 裸文本）一律**不**判静默 —— 保持旧行为，避免把
+          `stop_on_ai_empty`（配置说明写的是"仅包含空消息"）的触发面扩大。
+        """
+        t = self.visible_output(xml)
+        if not t.strip():
+            return True                       # 完全没内容（含空响应/纯空白）
+        try:
+            root = ET.fromstring(f"<root>{t}</root>")
+        except Exception:
+            return False                      # 畸形 ⇒ 保守，不判静默
+        msgs = root.findall('msg')
+        if not msgs:
+            # 没有任何 <msg>：纯 root 动作标签（<ignore>/<wake_extend>/…）或裸文本。
+            # 这些**不是**"空消息"语义 ⇒ 维持旧行为（不判静默），
+            # 不把 stop_on_ai_empty 的触发面扩大到"只要没发消息就停窗"。
+            return False
+        # 有 <msg>：先看 msg **之外**有没有裸文本（模型把话写在标签外 ⇒ 用户收不到，
+        # 但模型主观意图是"说了话"）⇒ 当作「有输出」处理，不判静默。
+        # ⚠ 只看 root.text 与子元素 tail：元素**内部**文本属于 msg 内容或
+        #   root 动作标签的值，不算"裸文本"（否则 <wake_extend>yes</wake_extend>
+        #   会被误判成裸文本）。
+        if (root.text or '').strip():
+            return False
+        if any((c.tail or '').strip() for c in root):
+            return False
+        return all(self._msg_is_empty(m) for m in msgs)
 
     def _check_stop_keywords(self, text: str, keywords: List[str]) -> bool:
         if not keywords:
@@ -1190,9 +1296,10 @@ class DebouncePlugin(BasePlugin):
         # 适配器会把 bot 自己发出的消息也作为普通消息事件送达（取决于实现/配置，例如
         # NapCat 的 reportSelfMessage），其 message.self_id 与 sender.user_id 相同。
         # 若不过滤：消息会被 note_incoming(is_bot=False) 记成「用户消息」——存在感占比、
-        # 累计评分、额外信号（user_msgs/session_msgs）、骚扰检测全部被自身发言污染，
-        # 且与 on.message_sent 的 note_bot_reply(is_bot=True) 重复计数。
-        # bot 自身发言的正确统计口径是「发送事件」(on.message_sent)，故此处整条丢弃。
+        # 累计评分、额外信号（user_msgs/session_msgs）、骚扰检测全部被自身发言污染。
+        # bot 自身发言的正确统计口径是「响应钩子」：存在感按**轮**记在
+        # on_llm_response（且已排除静默轮），bot 发言条数按**条**记在
+        # on.message_sent（bot_speech 检测）。此处整条丢弃，两条通路都不受影响。
         self_id = str(event.message.self_id) if hasattr(event.message, 'self_id') and event.message.self_id is not None else None
         sender_id = str(event.message.sender.user_id) if event.message.sender else None
         if self_id and sender_id and self_id == sender_id:
@@ -1699,14 +1806,20 @@ class DebouncePlugin(BasePlugin):
         if resp.tool_calls:
             return
 
-        # 聊天增强引擎：存在感记录 + 休眠维持期（仅最终文本回复时）
-        self.enhance.on_llm_response(event, resp)
+        ai_text = (resp.text_response or "").strip()
+        # 一次性算出「可见输出」与「是否静默」供后续复用（避免重复解析 XML）
+        ai_visible = self.visible_output(ai_text)
+        ai_silent = self.is_silent_output(ai_text)
+
+        # 聊天增强引擎：存在感记录 + 休眠维持期（仅最终文本回复、且**非静默轮**时）。
+        # ★ 必须放在 ai_text 提取**之后**并传静默标志：静默轮（bot 只输出空 msg）
+        #   什么都没发出去，不该被当成一次"bot 发言"扣分 / 推进休眠维持期计数。
+        #   （旧实现无条件先记，空 msg 停窗的那一轮也被计了一次发言。）
+        self.enhance.on_llm_response(event, resp, silent=ai_silent)
         # 休眠维持期次数限制：达上限则结束维持期（wake_max_rounds 生效）
         if not self.enhance.dormant.can_reply(sid):
             self.enhance.dormant._awake_until.pop(sid, None)
             logger.debug(f"[Enhance] 休眠维持期达最大互动次数，结束: {sid}")
-
-        ai_text = (resp.text_response or "").strip()
 
         # 记录本次 LLM 回复所属会话（ignore/wake_extend tag 处理器用）。
         # 框架 tag 处理器签名只有 (value, **attrs) 无 event 上下文（core/tag/base.py），
@@ -1739,10 +1852,10 @@ class DebouncePlugin(BasePlugin):
                 else:
                     should_stop = False
                     stop_reason = ""
-                    if self.dm_stop_on_ai_empty and self._is_empty_msg(ai_text):
+                    if self.dm_stop_on_ai_empty and ai_silent:
                         should_stop = True
                         stop_reason = "空消息"
-                    elif self._check_stop_keywords(ai_text, self.dm_stop_on_ai_keywords):
+                    elif self._check_stop_keywords(ai_visible, self.dm_stop_on_ai_keywords):
                         should_stop = True
                         stop_reason = "AI停止关键词"
 
@@ -1782,7 +1895,7 @@ class DebouncePlugin(BasePlugin):
         # === 群聊持续对话 ===
         if event.is_group_message() and self.sustain_enabled and self._is_sustain_allowed(sid):
             should_stop = False
-            if self.stop_on_ai_empty and self._is_empty_msg(ai_text):
+            if self.stop_on_ai_empty and ai_silent:
                 if self.sustain_retry_on_empty:
                     # 空 msg 只是"这次不回"：评分达标才重开窗口等评分补上再触发；
                     # 评分不足则停止窗口（防概率=1 时空消息无限重开循环）
@@ -1806,7 +1919,7 @@ class DebouncePlugin(BasePlugin):
                     return
                 should_stop = True
                 logger.debug(f"[Sustain] AI 输出空消息，停止窗口: {sid}")
-            elif self._check_stop_keywords(ai_text, self.stop_on_ai_keywords):
+            elif self._check_stop_keywords(ai_visible, self.stop_on_ai_keywords):
                 should_stop = True
                 logger.debug(f"[Sustain] AI 回复包含停止关键词，停止窗口: {sid}")
 
@@ -1956,6 +2069,19 @@ class DebouncePlugin(BasePlugin):
         阶段）**时不会派发（send_llm_text 提前 return），in-flight 只能干等 stall 超时
         （默认约 180s）；本钩子在 agent 循环之外派发，一定能到。"""
         await self.merge_scheduler.on_final_result(event, final_result)
+
+    # ================= 消息发送（bot 自身发言条数检测） =================
+    # bot_speech 按「条」检测（设计如此）：一次回复里的每个 <msg> 分段各算一条。
+    # 框架在 send_xml_messages 里对每个 MessageChain 派发一次 ON_MESSAGE_SENT
+    # （core/message_manager.py）；若 accel 一类插件抢先发送并自行补广播，
+    # 走的是同一个事件，无需特殊处理。
+    @on.message_sent(priority=Priority.LOW)
+    async def on_bot_message_sent(self, event, chain=None, result=None, *_):
+        """把框架发送事件转给增强引擎（bot_speech 条数检测）。
+
+        用 LOW 优先级：让其它插件（如 accel 的剥离/观测）先跑完，再统计。
+        """
+        self.enhance.on_message_sent(event)
 
     # ================= 并行媒体识别（转发给 ParallelMediaRecognizer） =================
     # 注意：im_message 钩子必须定义在 handle_msg 之后（同优先级按注册顺序执行），
