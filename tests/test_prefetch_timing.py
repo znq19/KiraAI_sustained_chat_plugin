@@ -158,20 +158,25 @@ async def a_fixed_order_starts_prefetch(plugin_dir):
 
 
 async def b_old_order_prefetch_dies(plugin_dir):
-    """反向验证：**只在 handle_msg 里调度**（旧代码 v2.5.13~v2.5.17 的做法）
-    → 预取 worker 在 stage1 的第一次 await 时抢跑，媒体表还是空的 → 0 次 VLM。
+    """新保证（v2.6.0 / Fix 3）：**提前**调度的预取也会等后台登记收尾 ——
+    「worker 抢跑读到空媒体表」从构造上消除。
 
-    做法：显式调 `schedule_prefetch`（模拟旧调用点），且不给消息打 `_batch_entered`
-    标记（= 新版 stage1 末尾的调度不会介入）→ 若预取仍启动，说明竞态不存在。"""
+    历史（v2.5.13~v2.5.17）：handle_msg 里 schedule 的 worker 在 stage1 第一次
+    await 时抢跑，读到空表直接退出（本测试曾据此反向验证竞态，断言 0 次 VLM）。
+    v2.5.18 把调度点挪到 stage1 末尾；v2.6.0 登记本身也后台化，worker 统一先等
+    _stage1_pending 收尾再读表 —— 任何调用点、任何时序都不可能再读到空表。
+
+    做法同旧反向验证：显式调 `schedule_prefetch`（模拟「登记完成前」的提前调度），
+    不给消息打 `_batch_entered`（自动调度不介入，纯测这一条通道）。"""
     mod = load_mr(plugin_dir)
     mr = make_mr(mod)
     calls = spy(mr)
     m, _ = make_msg(batch=False)               # 无标记：只有"旧调用点"这一条调度
-    mr.schedule_prefetch(SID, [m])             # ← 旧代码在 handle_msg 里的调用
-    await mr.on_im_message(make_event(m))      # stage1 随后才登记媒体
+    mr.schedule_prefetch(SID, [m])             # ← 登记完成前的提前调度
+    await mr.on_im_message(make_event(m))      # stage1 随后才启动后台登记
     await settle()
-    return {"旧顺序确实 0 次 VLM（反向验证竞态）": len(calls) == 0,
-            "（对照）新版标记路径不受影响": bool(getattr(m, "_batch_entered", False)) is False}
+    return {"提前调度不再读空表（≥1 次 VLM）": len(calls) >= 1,
+            "（对照）自动调度未介入": bool(getattr(m, "_batch_entered", False)) is False}
 
 
 async def c_media_skip_not_prefetched(plugin_dir):
@@ -235,7 +240,7 @@ async def g_second_schedule_is_deduped(plugin_dir):
 
 SCENARIOS = [
     ("A 修复后顺序：进批次即启动预取", a_fixed_order_starts_prefetch),
-    ("B 反向验证：旧顺序预取失效（0 次 VLM）", b_old_order_prefetch_dies),
+    ("B 新保证：提前调度的预取等登记收尾（竞态构造性消除）", b_old_order_prefetch_dies),
     ("C 仅唤醒识别判定不变：_media_skip 不预取", c_media_skip_not_prefetched),
     ("D 未进批次的消息不预取", d_not_in_batch_not_prefetched),
     ("E 表情包与图片同规则", e_sticker_and_image_both),

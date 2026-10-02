@@ -216,7 +216,7 @@
       },
       "sustain_mode": {
         "name": "群聊持续回复模式",
-        "type": "enum",
+        "type": "string",
         "options": [
           "per_message",
           "per_round"
@@ -238,7 +238,7 @@
       },
       "sustain_judge_timing": {
         "name": "持续回复判定时机",
-        "type": "enum",
+        "type": "string",
         "options": [
           "both",
           "either",
@@ -308,7 +308,7 @@
       },
       "dm_sustain_mode": {
         "name": "私聊持续模式",
-        "type": "enum",
+        "type": "string",
         "options": [
           "per_round",
           "per_retry"
@@ -389,7 +389,7 @@
       },
       "dm_tool_blacklist_mode": {
         "name": "私聊工具黑名单匹配模式",
-        "type": "enum",
+        "type": "string",
         "options": [
           "partial",
           "exact"
@@ -515,7 +515,7 @@
       },
       "scheduled_type": {
         "name": "调度类型",
-        "type": "enum",
+        "type": "string",
         "options": [
           "interval",
           "cron"
@@ -569,7 +569,7 @@
       },
       "scheduled_tool_blacklist_mode": {
         "name": "定时任务工具黑名单匹配模式",
-        "type": "enum",
+        "type": "string",
         "options": [
           "partial",
           "exact"
@@ -972,7 +972,7 @@
         "hint": "bot 自设时长超过该值则钳制（仅允许自设时生效）"
       },
       "scope": {
-        "type": "enum",
+        "type": "string",
         "name": "累计范围",
         "default": "per_user",
         "options": [
@@ -1021,7 +1021,7 @@
         "default": 300
       },
       "scope": {
-        "type": "enum",
+        "type": "string",
         "name": "累计范围",
         "default": "per_user",
         "options": [
@@ -1068,7 +1068,7 @@
         "default": 300
       },
       "scope": {
-        "type": "enum",
+        "type": "string",
         "name": "累计范围",
         "default": "per_user",
         "options": [
@@ -1115,7 +1115,7 @@
         "default": 300
       },
       "scope": {
-        "type": "enum",
+        "type": "string",
         "name": "累计范围",
         "default": "per_user",
         "options": [
@@ -1144,7 +1144,7 @@
         "hint": "休眠期内被提及（@/唤醒词/戳一戳）推送给 LLM 的概率（0-1）"
       },
       "wake_keep_mode": {
-        "type": "enum",
+        "type": "string",
         "name": "维持模式",
         "default": "renew",
         "options": [

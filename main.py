@@ -1584,11 +1584,9 @@ class DebouncePlugin(BasePlugin):
                         self.batch_started.pop(sid, None)
                         self.batch_count.pop(sid, None)
                         return
-                # 顺延进行中：非唤醒消息也重置计时器（最后一条消息到达后 N 秒无新消息才 flush）
-                # —— 仅当批次已开启（有唤醒/命中）时才允许重置顺延：无唤醒来历的非唤醒
-                #    消息绝不能启动顺延/flush（否则开了次 LLM 后所有围观消息都进批次）
-                if _batch_on and sid in self.session_events and sid in self.session_tasks:
-                    self.session_events[sid].set()
+                # 顺延重置已移至 on_buffered（Fix 1：以「消息真正进缓冲」为唯一武装/重置点）。
+                # 无唤醒来历的非唤醒消息不启动顺延/flush 的保险丝语义不变：
+                # on_buffered 里 batch_started 为假即直接返回。
                 if self.group_proactive_chat and event.is_group_message() \
                         and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid) \
                         and self._is_proactive_allowed(sid):
@@ -1617,35 +1615,22 @@ class DebouncePlugin(BasePlugin):
                 event.discard()
             return
 
-        # === 唤醒消息：启动/延续批次 ===
+        # === 唤醒消息：打唤醒意图标记（批次确立/顺延武装在 on_buffered，见 Fix 1） ===
         event.buffer()
-        # 同上（唤醒消息）：媒体已确定进批次 → 打标记，预取由 stage1 末尾统一调度
+        # 同上（唤醒消息）：媒体已确定进批次 → 打标记，预取由 stage1 登记后统一调度
         event.message._batch_entered = True
+        # Fix 1：批次状态（batch_started/batch_count）与顺延的启动/重置**不再在这里做**。
+        # 框架要等全部 ON_IM_MESSAGE 钩子跑完才真正 buffer.add（core/message_manager.py），
+        # 此刻消息尚未进缓冲；若在此时启动顺延，stage1 媒体预处理一旦慢于顺延窗口，
+        # _debounce_loop 的 buffer_len==0 分支会把还没落地的批次误判为「已被外部消费」
+        # 清掉 → 唤醒消息沦为孤儿前文，要等下一次真实唤醒才被带出
+        # （2026-10-02 引用 bot 图片卡 5 分钟事故）。这里只打 _wake_pending 意图标记，
+        # 由 on_buffered（框架 buffer.add 后立即派发）统一确立批次并武装顺延。
+        event.message._wake_pending = True
         if not self.batch_started.get(sid, False):
-            # 首个唤醒消息：批次开始，计数从 1（含唤醒本身）
-            self.batch_started[sid] = True
-            self.batch_count[sid] = 1
-            # ★ 起批预热（v2.5.19）：缓冲里的「前文」会随本批一起送进 LLM，而
-            #   "起批 → 顺延到点"这段本来就是等待窗口 → 现在就把它们的媒体预热，
-            #   放行时零识别开销。不含本条（它自己的 stage1 登记还没跑，会被读成空；
-            #   本条由上面的 _batch_entered 标记在 stage1 末尾调度）。
+            # ★ 起批预热（v2.5.19）：缓冲里的「前文」会随本批一起送进 LLM →
+            #   现在就把它们的媒体预热（后台识别，与本条 stage1 登记并行），放行时零识别开销。
             self._warmup_context_media(sid, event)
-        else:
-            # 批次中的唤醒消息：只当普通消息计数，不重置批次
-            self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
-        # 满即推：批次计数达到 max_buffer_messages
-        if self.max_buffer_messages > 0 and self.batch_count[sid] >= self.max_buffer_messages:
-            event.flush()
-            # 批次已满即推，清理批次状态（下一批从 0 开始）
-            self.batch_started.pop(sid, None)
-            self.batch_count.pop(sid, None)
-            return
-
-        if sid not in self.session_events:
-            self.session_events[sid] = asyncio.Event()
-        if sid not in self.session_tasks:
-            self.session_tasks[sid] = asyncio.create_task(self._debounce_loop(sid))
-        self.session_events[sid].set()
 
     def _warmup_context_media(self, sid: str, event) -> None:
         """起批时把缓冲里「前文」的媒体丢进预取池（它们会随本批一起送进 LLM）。
@@ -1670,6 +1655,60 @@ class DebouncePlugin(BasePlugin):
                 self.media_recognizer.schedule_prefetch(sid, msgs, reason="起批预热前文")
         except Exception as e:
             logger.debug(f"[MediaRecognize] 起批预热前文失败（忽略）: {type(e).__name__}: {e}")
+
+    @on.message_buffered(priority=Priority.HIGH)
+    async def on_buffered(self, sid: str, *_):
+        """消息真正落缓冲后：确立批次状态 + 启动/重置顺延（Fix 1 的唯一武装点）。
+
+        框架只在全部 ON_IM_MESSAGE 钩子跑完后才 buffer.add 并随即派发本事件
+        （core/message_manager.py handle_im_message）——以此刻为批次/顺延的武装点，
+        「顺延窗口到点」必然晚于「消息落地」，handle_msg 与缓冲落地之间的竞态根除：
+          · 唤醒消息（handle_msg 打了 _wake_pending）：确立/累加批次计数，满即推；
+          · 批次已开启时任何消息落地：重置顺延（语义 = 最后一条**进缓冲**后
+            N 秒无新消息才 flush，比旧的「进钩子」起算更准）；
+          · 纯前文（批次未开启）：不启动顺延（保险丝语义不变）。
+        """
+        try:
+            buf = self.ctx.get_buffer(sid)
+            items = getattr(buf, "buffer", None) or []
+            for _it in list(items):
+                _m = getattr(_it, "message", None)
+                if _m is None or not getattr(_m, "_wake_pending", False):
+                    continue
+                try:
+                    delattr(_m, "_wake_pending")
+                except Exception:
+                    pass
+                # 停窗后迟到的「持续命中」消息不确立批次（不回一轮，留作前文等下次
+                # 真唤醒带走）——与 QueueMerge.drop_sustain_pending 同判定，此处是缓冲层
+                if self.sustain_stopped.get(sid):
+                    _hits = self.sustain_hit_ids.get(sid) or set()
+                    _mid = getattr(_m, "message_id", None)
+                    if _mid is not None and _mid in _hits:
+                        continue
+                if not self.batch_started.get(sid, False):
+                    self.batch_started[sid] = True
+                    self.batch_count[sid] = 1
+                else:
+                    self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
+                # 满即推：批次计数达到上限立即刷出（此刻消息已在缓冲，直接 flush）
+                if self.max_buffer_messages > 0 and self.batch_count[sid] >= self.max_buffer_messages:
+                    self.batch_started.pop(sid, None)
+                    self.batch_count.pop(sid, None)
+                    try:
+                        await self.ctx.message_processor.flush_session_messages(sid)
+                    except Exception:
+                        logger.exception(f"[Debounce] Error flushing session {sid}")
+                    return
+            if not self.batch_started.get(sid, False):
+                return
+            if sid not in self.session_events:
+                self.session_events[sid] = asyncio.Event()
+            if sid not in self.session_tasks or self.session_tasks[sid].done():
+                self.session_tasks[sid] = asyncio.create_task(self._debounce_loop(sid))
+            self.session_events[sid].set()
+        except Exception:
+            logger.exception(f"[Debounce] on_buffered error: {sid}")
 
     async def _debounce_loop(self, sid: str):
         event = self.session_events[sid]
