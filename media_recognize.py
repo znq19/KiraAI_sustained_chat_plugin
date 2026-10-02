@@ -171,6 +171,11 @@ class ParallelMediaRecognizer:
         # 预取专用信号量（并发隔离，见上）与裸 create_task 强引用集（防 GC 提前回收）
         self._prefetch_sem = asyncio.Semaphore(max(1, self.vlm_prefetch_max_parallel))
         self._bg_tasks: set = set()
+        # stage1 后台登记任务表（v2.6.0，Fix 3）：id(message) -> Task。
+        # ON_IM_MESSAGE 只做零 I/O 的同步收口（语音占位/挂表），下载/md5/DB/落盘
+        # 全部挪进后台登记任务；stage2/stage3/预取 worker 开跑前先等它收尾，
+        # 保证「登记完成前不会有阶段读到空媒体表」（与 v2.5.18 的调用点修复同语义）。
+        self._stage1_pending: dict[int, "asyncio.Task"] = {}
         # 媒体缓存清理任务（懒启动，首个 url 媒体落盘时拉起）；
         # URL 失效重取注册表：media_id -> (message_id, adapter_name)，stage1 登记，
         # 下载失败时凭它经适配器 get_msg 拿新鲜 URL（napcat 的 get_msg 会刷新 rkey）
@@ -479,79 +484,211 @@ class ParallelMediaRecognizer:
             return
         try:
             self._flatten_forwards(event.message.chain)
-            media: dict[str, dict] = {}
             _sid = getattr(getattr(event, "session", None), "sid", None)
             targets: list = []
             self._collect_media_targets(event.message.chain, targets, set(), sid=_sid)
-            if targets:
-                # 并行预填充（限流 4）：原实现逐元素串行 await（URL 下载算 hash + DB 查询
-                # + 语音 to_base64），一条 k 图消息的 flush 被推迟 k×(下载+DB)；
-                # 先收集再 gather，媒体预填充不再卡在首 token 关键路径上
-                sem = asyncio.Semaphore(4)
-
-                async def _prefill_one(t):
-                    kind, elem, mtype, ch, idx = t
-                    async with sem:
-                        if kind == "prefill":
-                            await self._prefill_media(elem, mtype, media)
-                        else:
-                            replaced = await self._replace_media(elem, "Record", media)
-                            if replaced is not None:
-                                ch[idx] = replaced
-
-                await asyncio.gather(*[_prefill_one(t) for t in targets],
-                                     return_exceptions=True)
-            if media:
-                # URL 失效重取注册表：记录 media_id → (message_id, adapter_name)，
-                # 下载失败时凭 message_id 经适配器 get_msg 拿新鲜 URL（见 _refresh_media_url）
-                try:
-                    _msg_id = getattr(event.message, "message_id", None)
-                    _ainfo = getattr(event, "adapter", None)
-                    _aname = getattr(_ainfo, "name", None) or getattr(_ainfo, "adapter_id", None)
-                    if _msg_id:
-                        if len(self._media_source) > 2048:
-                            for _k in list(self._media_source)[: len(self._media_source) - 1024]:
-                                self._media_source.pop(_k, None)
-                        for _k in media:
-                            self._media_source[_k] = (str(_msg_id), _aname)
-                except Exception:
-                    pass
-                # 合并而非覆盖：并行识图插件（PIR）可能已先写入 Image 索引，
-                # 直接覆盖会让它 stage2/stage3 拿不到图片（图片标识符永远空）
-                existing = getattr(event.message, self._media_attr, None) or {}
-                setattr(event.message, self._media_attr, {**existing, **media})
-                # 同时登记到「本会话本回合暂存索引」：stage3 兜底据此在 LLM 请求前
-                # 抢救未被回填的媒体。必须在本阶段就登记（不能只在 stage2 登记）——
-                # stage2 所在批次可能被第三方插件 stop 掉而根本不执行，那样 stage3
-                # 将无从得知有哪些待识别媒体，官方空占位 [Image , file_path: p] /
-                # [Sticker ] 就会原样送到 LLM（= 看不见图）。
-                if _sid:
-                    bucket = self._round_media.setdefault(_sid, {})
-                    bucket.update(media)
-                    # 桶内限长：每 sid 最多 64 条（批次被 stop 到不了 llm_request 清理点时
-                    # 桶会持续增长），超出按插入顺序淘汰最旧
-                    if len(bucket) > 64:
-                        for _k in list(bucket)[: len(bucket) - 64]:
-                            bucket.pop(_k, None)
-                    # 有界清理（与 stage2 同范式）：最多保留 128 个 sid 的索引
-                    if len(self._round_media) > 128:
-                        for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
-                            self._round_media.pop(old_sid, None)
-                # ★ 真·预取的**唯一正确调度点**：媒体已登记（_pir_media 已写好）之后
-                #   立刻后台识别。宿主在消息确定进批次时（event.buffer() 之后）打了
-                #   _batch_entered 标记，这里只为"确实会进 LLM"的消息预取。
-                #
-                #   ⚠ 为什么不能像 v2.5.13 那样在 handle_msg 里调度：本阶段（stage1）
-                #   是**后注册**的钩子，handle_msg 里 create_task 的预取 worker 会在
-                #   本阶段的第一次 await（_cache_get → 数据库查询 / URL 图片下载，必然
-                #   让出事件循环）时抢先运行 —— 那时 _pir_media 还没写入 → worker 读到
-                #   空 → 直接返回（一次性任务，不重试）→ 预取形同虚设，识别只能等到
-                #   批次被推送的 stage2（用户感觉"等推批次才识别"；被其它插件拦截、
-                #   stage2 不跑的批次更是永远拿不到描述）。
-                if _sid and getattr(event.message, "_batch_entered", False):
-                    self.schedule_prefetch(_sid, [event.message], reason="进批次即识别")
+            if not targets:
+                return
+            media: dict[str, dict] = {}
+            # ── 同步收口（零 I/O，v2.6.0 / Fix 3）────────────────────────────
+            # 语音 Record **立即**替换为 [Record #noid: ] 占位标识符：框架在批次渲染时
+            # 会对仍是 Record 的元素做自动 STT（message_format_to_text），异步替换
+            # 赶不上「满即推 / trigger / 拦截后快速放行」的批次渲染。占位替换本身
+            # 不需要任何 I/O（md5/缓存由后台登记任务补齐），留在同步段。
+            for kind, elem, mtype, ch, idx in targets:
+                if kind == "record":
+                    replaced = self._replace_record_sync(elem, media)
+                    ch[idx] = replaced
+            # 合并而非覆盖：并行识图插件（PIR）可能已先写入 Image 索引，
+            # 直接覆盖会让它 stage2/stage3 拿不到图片（图片标识符永远空）
+            existing = getattr(event.message, self._media_attr, None) or {}
+            merged = {**existing, **media}
+            setattr(event.message, self._media_attr, merged)
+            # 重活全部进后台登记任务（下载/落盘/md5/DB 缓存查询），ON_IM_MESSAGE
+            # 钩子链对任何媒体消息都不再做网络/DB/磁盘等待：框架立刻就能打印日志、
+            # 把消息放进会话缓冲（宿主 Fix 1 的 on_buffered 随之即时武装顺延）。
+            # 图片登记结果写进同一个 merged 表；stage2/stage3/预取 worker 开跑前
+            # 会先等 _stage1_pending 收尾，不会读到空媒体表。
+            _msg_id = getattr(event.message, "message_id", None)
+            _ainfo = getattr(event, "adapter", None)
+            _aname = getattr(_ainfo, "name", None) or getattr(_ainfo, "adapter_id", None)
+            self._launch_stage1_register(_sid, event.message, targets, merged,
+                                         _msg_id, _aname)
         except Exception:
             logger.exception("stage1 error")
+
+    def _replace_record_sync(self, elem, media: dict) -> Text:
+        """语音 Record → [Record #noid: ] 占位标识符（**同步、零 I/O**）。
+
+        键固定为 noid_{id(elem)}：md5 由后台登记任务补齐（缓存命中时描述直接写进
+        结果池与占位文本；未命中保持待识别，stage2 照常接力 STT）。占位必须先于
+        批次渲染存在，否则框架会对 Record 元素自动 STT（串行、无限流、无缓存）。
+        """
+        short_id = f"noid_{id(elem)}"
+        try:
+            elem._pir_short_id = short_id   # 与 _prefill_media 同约定：把键钉在元素上
+        except Exception:
+            pass
+        info = {"md5": None, "elem": elem, "type": "Record", "_done": False}
+        txt = Text(f"[Record #{short_id}: ]")
+        info["text_elem"] = txt   # 后台缓存命中时把描述/路径写回占位文本
+        media[short_id] = info
+        return txt
+
+    def _launch_stage1_register(self, sid, message, targets, bucket: dict,
+                                msg_id=None, adapter_name=None) -> None:
+        """启动后台登记任务并挂进 _stage1_pending（stage2/stage3/预取会等它收尾）。"""
+        try:
+            task = asyncio.create_task(
+                self._stage1_register(sid, message, targets, bucket, msg_id, adapter_name))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            if len(self._stage1_pending) < 256:
+                key = id(message)
+                self._stage1_pending[key] = task
+                task.add_done_callback(lambda _t, k=key: self._stage1_pending.pop(k, None))
+        except Exception as e:
+            logger.debug(f"stage1 register schedule failed: {type(e).__name__}: {e}")
+
+    async def _stage1_register(self, sid, message, targets, bucket: dict,
+                               msg_id=None, adapter_name=None) -> None:
+        """后台登记（原 stage1 的重活部分）：落盘 → md5 → 缓存 → 写登记表 → 按需预取。
+
+        与 v2.5.18 的调用点修复同语义：**登记完成之后**才允许调度预取；
+        区别是登记本身也移出了钩子链——识别/落盘与消息顺延窗口并行推进，
+        不再阻塞 [message] 日志与消息进缓冲（2026-10-02 引用图 8s 卡钩子链事故）。
+        """
+        try:
+            sem = asyncio.Semaphore(4)
+
+            async def _one(t):
+                kind, elem, mtype, ch, idx = t
+                async with sem:
+                    if kind == "prefill":
+                        await self._register_image_one(elem, mtype, bucket)
+                    else:
+                        await self._register_record_one(sid, elem, bucket)
+
+            await asyncio.gather(*[_one(t) for t in targets], return_exceptions=True)
+            # URL 失效重取注册表：记录 media_id → (message_id, adapter_name)，
+            # 下载失败时凭 message_id 经适配器 get_msg 拿新鲜 URL（见 _refresh_media_url）
+            try:
+                if msg_id:
+                    if len(self._media_source) > 2048:
+                        for _k in list(self._media_source)[: len(self._media_source) - 1024]:
+                            self._media_source.pop(_k, None)
+                    for _k in bucket:
+                        self._media_source[_k] = (str(msg_id), adapter_name)
+            except Exception:
+                pass
+            # 登记到「本会话本回合暂存索引」（stage3 抢救用；语义同旧 stage1）：
+            # 批次被第三方 stop、stage2 不跑时，stage3 仍知道有哪些待识别媒体。
+            if sid:
+                rm = self._round_media.setdefault(sid, {})
+                rm.update(bucket)
+                if len(rm) > 64:
+                    for _k in list(rm)[: len(rm) - 64]:
+                        rm.pop(_k, None)
+                if len(self._round_media) > 128:
+                    for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
+                        self._round_media.pop(old_sid, None)
+                # ★ 真·预取的调度点（原 stage1 末尾调用点平移到此，语义不变）：
+                #   只为「确实会进 LLM」的消息（宿主已打 _batch_entered）预取，
+                #   且必须在登记完成之后（否则 worker 读空表，v2.5.13 竞态复辟）。
+                if getattr(message, "_batch_entered", False):
+                    self.schedule_prefetch(sid, [message], reason="进批次即识别")
+        except Exception:
+            logger.exception("stage1 register error")
+
+    async def _register_image_one(self, elem, mtype: str, bucket: dict):
+        """图片/表情后台登记（原 _prefill_media，Fix 2 单次下载版）。
+
+        顺序：先 _persist_media 落盘（url 型**只下载这一次**，md5 直接取自落盘字节），
+        非 url / 落盘失败才退回 _elem_md5 现算 —— 旧实现 hash_image 与 to_base64
+        各下载一次（同一 URL 拉两遍）。
+        """
+        # 宿主 handle_msg 已做"仅唤醒/概率"决策：_media_skip=True = 本次不识别（省 VLM）
+        if getattr(elem, "_media_skip", False):
+            elem.caption = ""  # 官方空占位 + 阻止框架自动 VLM（caption 非 None）
+            return
+        # 已有有效描述（同一元素被重复登记等）：不覆盖、不重复识别
+        try:
+            _cur = (getattr(elem, "caption", None) or "").strip()
+            if _cur and self._is_valid_desc(_cur):
+                return
+        except Exception:
+            pass
+        md5 = None
+        try:
+            _p, md5 = await self._persist_media(elem)   # 到达即落盘（url 仅这次下载）
+        except Exception:
+            md5 = None
+        if not md5:
+            md5 = await self._elem_md5(elem)
+        if md5:
+            # guard 已知媒体登记（含下方缓存命中提前 return 的分支）：此后框架 read_file
+            # 补读该媒体由 guard 拦截，不再二次付费 VLM
+            self._remember_known(md5=md5)
+        short_id = md5[:8] if md5 else f"noid_{id(elem)}"
+        # 把本阶段使用的键钉在元素上（理由同旧实现：框架渲染前压缩会改 elem.md5）
+        try:
+            elem._pir_short_id = short_id
+        except Exception:
+            pass
+        if md5:
+            desc = await self._cache_get(md5) or ""
+            if desc and not self._is_valid_desc(desc):
+                desc = ""
+            if desc:
+                # 缓存命中：直接预置官方描述（零 VLM）。不进登记表（_done 隐含），
+                # 同一批消息重发时无需再处理——stage2 只认登记表里的媒体。
+                elem.caption = desc
+                return
+        # 未命中：登记原元素供 stage2 并行识别（唤醒/概率命中路径）
+        elem.caption = ""  # 先阻止框架自动 VLM，stage2 识别完成后回填官方格式
+        bucket[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": False}
+
+    async def _register_record_one(self, sid, elem, bucket: dict):
+        """语音后台登记（Fix 2 单次下载版）：md5/缓存补齐到同步段挂的占位条目。
+
+        缓存命中：描述写进结果池（stage2/stage3 直接命中）并回写占位文本
+        （含 file_path，格式与旧 _replace_media 一致）；未命中保持待识别，
+        stage2 照常接力并行 STT（三层限流 + 缓存）。
+        """
+        short_id = getattr(elem, "_pir_short_id", None) or f"noid_{id(elem)}"
+        info = bucket.get(short_id)
+        if not isinstance(info, dict):
+            return
+        md5 = None
+        try:
+            _p, md5 = await self._persist_media(elem)   # url 型仅这次下载
+        except Exception:
+            md5 = None
+        if not md5:
+            try:
+                md5 = await self._record_md5(elem)
+            except Exception:
+                md5 = None
+        if not md5:
+            return
+        self._remember_known(md5=md5)   # guard 已知媒体登记（同图片分支）
+        info["md5"] = md5
+        desc = await self._cache_get(md5) or ""
+        if desc and not self._is_valid_desc(desc):
+            desc = ""
+        if not desc:
+            return
+        info["_done"] = True
+        # 结果池打底：stage2 的「已有描述跳过」判据（_has_desc）直接命中
+        if sid:
+            pool = self._results_pool.setdefault(sid, {})
+            pool[short_id] = desc
+        # 回写占位文本：批次尚未渲染时，LLM 直接看到带描述的标识符
+        txt = info.get("text_elem")
+        if txt is not None:
+            p = await self._media_path(elem)
+            txt.text = (f"[Record #{short_id}: {desc}, file_path: {p}]" if p
+                        else f"[Record #{short_id}: {desc}]")
 
     def _collect_media_targets(self, chain, targets: list, visited: set,
                                sid: Optional[str] = None):
@@ -611,93 +748,6 @@ class ParallelMediaRecognizer:
         except Exception:
             return None
 
-    async def _prefill_media(self, elem, mtype: str, media: dict):
-        """图片/表情包 → 预置 caption（元素保留，不替换、不删除）。
-
-        对齐官方渲染（core/message_manager.py：Image → [Image {caption}, file_path: {p}]；
-        Sticker → [Sticker {caption}]），并按"仅唤醒识别/概率"省 VLM：
-        - 缓存命中 → elem.caption = desc：框架渲染官方带描述格式，零 VLM、零暂存；
-        - 未命中且宿主标记 _media_skip（非唤醒仅唤醒开 / 概率未中 / 超限）→ caption=""
-          （官方空占位 [Image , file_path: p] / [Sticker ]，LLM 知道有媒体但未识别），不暂存不 VLM；
-        - 未命中且未标记（唤醒 / 概率命中）→ caption="" + 暂存 _pir_media，
-          stage2 并行 VLM 后回填 message_str（官方格式）与 elem.caption。
-        Sticker 与 Image 同规则：元素永远保留 → Plus-One 复读表情包不受识别影响。
-        """
-        # 宿主 handle_msg 已做"仅唤醒/概率"决策：_media_skip=True = 本次不识别（省 VLM）
-        if getattr(elem, "_media_skip", False):
-            elem.caption = ""  # 官方空占位 + 阻止框架自动 VLM（caption 非 None）
-            return
-        md5 = await self._elem_md5(elem)
-        if md5:
-            # guard 已知媒体登记（含下方缓存命中提前 return 的分支）：此后框架 read_file
-            # 补读该媒体由 guard 拦截，不再二次付费 VLM
-            self._remember_known(md5=md5)
-        short_id = md5[:8] if md5 else f"noid_{id(elem)}"
-        # 把本阶段使用的键钉在元素上：框架 handle_im_batch_message 会在渲染前调用
-        # compress_image_element()（media.md5 = None + 换文件），随后 message_format_to_text
-        # 又会重新 hash_image() → 元素 md5 与 stage1 记录的键不再一致；若 stage2 仍从
-        # elem.md5 反推键，就会查不到 results → 识别结果无法合并（VLM 白跑、LLM 看不见图）。
-        try:
-            elem._pir_short_id = short_id
-        except Exception:
-            pass
-        # 到达即落盘：url 型媒体此刻就把字节持久化到插件自有缓存目录并设置
-        # elem._temp_path —— 之后识别/渲染/read_file 全链吃本地字节，URL 过期免疫；
-        # 缓存命中的图同样落盘（框架渲染 to_path 也受益）。失败静默降级，不阻塞流程
-        try:
-            await self._persist_media(elem, md5)
-        except Exception:
-            pass
-        if md5:
-            desc = await self._cache_get(md5) or ""
-            if desc and not self._is_valid_desc(desc):
-                desc = ""
-            if desc:
-                # 缓存命中：直接预置官方描述（零 VLM）。不进 media（_done 隐含），
-                # 同一批消息重发时无需再处理——stage2 只认 _pir_media 里的媒体。
-                elem.caption = desc
-                return
-        # 未命中：暂存原元素供 stage2 并行识别（唤醒/概率命中路径）
-        elem.caption = ""  # 先阻止框架自动 VLM，stage2 识别完成后回填官方格式
-        media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": False}
-
-    async def _replace_media(self, elem, mtype: str, media: dict) -> Optional[Text]:
-        """语音 Record → 标识符 Text（仅供 Record 使用；图片/表情包走 _prefill_media）。
-
-        语音替换为 [Record #id: ] 标识符：阻止框架自动 STT（串行、无限流），改由
-        stage2 并行 STT（三层限流 + image_desc_cache 缓存复用），语义与旧版一致。
-        _done 标记：缓存命中（已含内容）或已识别过 → 重发跳过，防重复 STT/429。
-        """
-        try:
-            md5 = await self._record_md5(elem)
-        except Exception:
-            md5 = None
-        if md5:
-            self._remember_known(md5=md5)   # guard 已知媒体登记（同 _prefill_media）
-            short_id = md5[:8]
-            desc = await self._cache_get(md5) or ""
-            if desc and not self._is_valid_desc(desc):
-                desc = ""
-        else:
-            short_id = f"noid_{id(elem)}"
-            desc = ""
-        try:
-            elem._pir_short_id = short_id  # 同 _prefill_media：把键钉在元素上
-        except Exception:
-            pass
-        # 到达即落盘（同 _prefill_media）：url 型语音持久化到插件自有缓存目录
-        try:
-            await self._persist_media(elem, md5)
-        except Exception:
-            pass
-        media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": bool(desc)}
-        if desc:
-            # 缓存命中：直接带 file_path（to_path 幂等，_temp_path 已缓存不重复下载）
-            p = await self._media_path(elem)
-            if p:
-                return Text(f"[Record #{short_id}: {desc}, file_path: {p}]")
-        return Text(f"[Record #{short_id}: {desc}]")
-
     async def _media_path(self, elem) -> Optional[str]:
         """对齐原版 message_format_to_text：to_path 落盘后转 data/ 相对路径。
 
@@ -753,6 +803,12 @@ class ParallelMediaRecognizer:
         if not self.enabled:
             return
         try:
+            # Fix 3：先等本批次消息的后台登记任务收尾（正常在顺延窗口里早已完成，
+            # 等待开销≈0；快速放行的批次保证不会读到空媒体表）
+            _reg = [self._stage1_pending.get(id(m)) for m in event.messages]
+            _reg = [t for t in _reg if t is not None and not t.done()]
+            if _reg:
+                await asyncio.gather(*_reg, return_exceptions=True)
             tasks = []  # [(message, media)]
             for message in event.messages:
                 media = getattr(message, self._media_attr, None)
@@ -892,8 +948,8 @@ class ParallelMediaRecognizer:
     def _batch_media_ids(self, event) -> set:
         """本批次消息链里**实际存在**的媒体 id 集合（stage3 抢救的准入条件）。
 
-        键与 stage1 一致（`elem._pir_short_id`，stage1 在 _prefill_media /
-        _replace_media 里钉在元素上）。用它而不是文本锚点来判定「这条媒体在不在
+        键与 stage1 一致（`elem._pir_short_id`，stage1 在 _register_image_one /
+        _replace_record_sync 里钉在元素上）。用它而不是文本锚点来判定「这条媒体在不在
         这次请求里」——官方空占位的锚点是通配的（见 on_llm_request ① 处注释）。
         """
         ids = set()
@@ -988,6 +1044,12 @@ class ParallelMediaRecognizer:
         try:
             if self._pir_active() or self._native_mode(sid):
                 return
+            # Fix 3：先等这些消息的后台登记收尾（warmup 等早起调度点不会读到空表，
+            # 与 v2.5.18「登记完成后再调度」同一语义）
+            _reg = [self._stage1_pending.get(id(m)) for m in messages]
+            _reg = [t for t in _reg if t is not None and not t.done()]
+            if _reg:
+                await asyncio.gather(*_reg, return_exceptions=True)
             media: dict = {}
             for m in messages:
                 # 只取 stage1 已登记的「待识别」媒体（含已被替换掉的 Record 语音）。
@@ -1386,6 +1448,11 @@ class ParallelMediaRecognizer:
         if not self.enabled:
             return
         try:
+            # Fix 3：同 stage2，先等本批次消息的后台登记收尾（抢救的准入信息才完整）
+            _reg = [self._stage1_pending.get(id(m)) for m in (getattr(event, "messages", None) or [])]
+            _reg = [t for t in _reg if t is not None and not t.done()]
+            if _reg:
+                await asyncio.gather(*_reg, return_exceptions=True)
             need: dict[str, str] = {}  # sid -> 标识符/占位形态
             for p in getattr(req, "user_prompt", []) or []:
                 text = getattr(p, "content", "") or ""
@@ -1793,7 +1860,7 @@ class ParallelMediaRecognizer:
     def _remember_known(self, md5: Optional[str] = None, phash: Optional[str] = None):
         """登记「本插件已接管」的媒体指纹（进程内、有界 FIFO，全程静默）。
 
-        登记点：stage1 _prefill_media / _replace_media（md5 算出即登记，含缓存命中
+        登记点：stage1 _register_image_one / _register_record_one（md5 算出即登记，含缓存命中
         分支）、_persist_media（字节在手，顺手 dHash）、_phash_remember（识别成功后）。
         用户配置「不识别」的媒体（_media_skip 提前 return 分支）刻意**不登记**——
         guard 不拦截、read_file 放行原函数，尊重用户省 VLM 的既定语义。
@@ -2003,30 +2070,34 @@ class ParallelMediaRecognizer:
         except Exception:
             return Path("data") / "plugins_media_cache"
 
-    async def _persist_media(self, elem, md5: Optional[str] = None) -> Optional[str]:
+    async def _persist_media(self, elem, md5: Optional[str] = None):
         """到达即落盘：url 型媒体字节持久化到插件自有缓存目录，并设置 elem._temp_path。
+
+        返回 (path, md5v)：md5v 为内容 md5（调用方传入或现算）——Fix 2 让调用方
+        「先落盘拿字节、md5 从字节现算」，url 型媒体全程只下载一次（旧实现
+        hash_image 与 to_base64 各下载一次）。
 
         - 不改 elem.file/file_type：native 模式与框架渲染（compress/to_path）完全不受影响，
           to_path() 命中 _temp_path 直接返回本地文件 → 识别/渲染/read_file 全链 URL 失效免疫；
         - 文件名按内容 md5 命名：同图天然去重，重复命中只刷新 mtime（LRU）；
-        - 任何失败都静默降级（返回 None），不影响后续 URL 路径。
+        - 任何失败都静默降级（返回 (None, None)），不影响后续 URL 路径。
         """
         if not self.media_cache_enabled:
-            return None
+            return None, None
         try:
             if getattr(elem, "file_type", "") != "url":
-                return None
+                return None, None
             old = getattr(elem, "_temp_path", None)
             if old and os.path.exists(old):
-                return old
+                return old, md5
             b64 = await asyncio.wait_for(elem.to_base64(), timeout=self.download_timeout)
             if not b64:
-                return None
+                return None, None
             if b64.startswith("data:"):
                 b64 = b64.split(",", 1)[-1]
             data = base64.b64decode(b64)
             if not data:
-                return None
+                return None, None
             md5v = md5 or hashlib.md5(data).hexdigest()
             # guard 已知媒体登记：字节已在手，图片/表情顺手算 dHash（同图重压缩副本
             # 也能被 guard 识别为已知媒体）；失败静默，不影响落盘主流程
@@ -2066,9 +2137,9 @@ class ParallelMediaRecognizer:
             except Exception:
                 pass
             self._ensure_mc_cleanup()
-            return str(path)
+            return str(path), md5v
         except Exception:
-            return None
+            return None, None
 
     def _mc_protected_paths(self) -> set:
         """在飞/待识别条目引用的缓存文件（对应批次还没进 LLM，绝不能删）。"""

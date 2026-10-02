@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.5.22
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.6.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -353,6 +353,28 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.6.0
+
+- **修复「引用 bot 图片 → 回复卡住、要等下一批一起触发」（根因级）**
+  - **现象**（用户日志）：用户引用回复 bot 自己发的图片后 bot 长时间不回，该消息
+    被压到下一次 @ 才连同后续消息一起进 LLM（实测压了 5 分 16 秒）。
+  - **根因**：框架要等**全部 ON_IM_MESSAGE 钩子跑完**才把消息真正放进会话缓冲
+    （`core/message_manager.py`），而旧版在 `handle_msg`（钩子链中途）就确立批次并
+    启动顺延；stage1 对**引用图**（URL 型）的预处理（下载×2+DB）一旦慢于顺延窗口，
+    顺延到点时缓冲还是空的 → 批次被误判为「已被外部消费」清掉 → 唤醒消息沦为
+    孤儿前文，永远没人 flush。
+  - **修法（Fix 1）**：批次确立与顺延启动/重置统一移到 `@on.message_buffered`
+    （框架 buffer.add 后立即派发）——以「消息真正进缓冲」为唯一武装点，竞态根除；
+    停窗后迟到的持续命中消息在缓冲层同样不确立批次（与 QueueMerge 同判定）。
+  - **修法（Fix 2/3）**：stage1 重活（下载/落盘/md5/缓存查询）**全部移出钩子链**，
+    改为后台登记任务（stage2/stage3/预取开跑前等它收尾，语义同 v2.5.18 调用点修复）；
+    URL 型媒体全程只下载一次（先落盘再从字节算 md5）。ON_IM_MESSAGE 对任何媒体消息
+    不再产生网络/DB/磁盘等待，[message] 日志与进缓冲即时完成，识别与顺延窗口并行。
+- **规范对齐**：schema 已废弃的 `type:"enum"`（11 处）全部改为 `string`+`options`
+  （配置值不受影响）。注：QueueMerge 的 ON_FINAL_RESULT 兜底推送在 KiraAI **v2.34.4+**
+  才真正触发，旧版本自动退回 stall 超时兜底（功能可用、延迟略高），core_version 维持
+  `>=2.29.6` 不变。
 
 ### v2.5.22
 

@@ -215,13 +215,19 @@ def spy_describe(plug):
 
 
 async def drive(plug, ctx, m, mentioned):
-    """按框架顺序驱动：handle_msg(HIGH,先) → 框架 buffer.add → stage1(HIGH,后)。"""
+    """按框架真实顺序驱动（v2.6.0 修正，对齐 core/message_manager.py）：
+    handle_msg(HIGH,先) → stage1(HIGH,后) → 框架 buffer.add → ON_MESSAGE_BUFFERED。
+
+    ⚠ 旧版 drive 把 buffer.add 插在 handle_msg 与 stage1 之间，那不是框架真实顺序
+    （框架先跑完全部 ON_IM_MESSAGE 钩子才 buffer.add）；且 v2.6.0（Fix 1）起批次
+    确立/顺延武装在 on_buffered，必须调用它才算完整驱动一轮。"""
     session = Session(adapter_name="qq", session_type="gm", session_id="427674145")
     ev = SEvent(m, session, mentioned=mentioned)
     await plug.handle_msg(ev)
+    await plug.media_recognizer.on_im_message(ev)
     if ev.process_strategy == "buffer":
         ctx.get_buffer(SID).buffer.append(Shim(m))
-    await plug.media_recognizer.on_im_message(ev)
+        await plug.on_buffered(SID)
     for _ in range(30):
         await asyncio.sleep(0.02)
     return ev
