@@ -167,6 +167,93 @@ def p2_config(jev):
         "P2 未启用不 ready": not jev.JevConfig(enabled=False, links=[("https://a", "k", "m")]).ready,
     }
 
+# ------------------------------------------------ P2b 提供商分组（3.1.1 决策模型）
+class _ProvInfo:
+    def __init__(self, mid, name, base, key, pname="测试商"):
+        self.model_id = mid
+        self.model_name = name
+        self.provider_id = "p"
+        self.provider_name = pname
+        self.provider_config = {"base_url": base, "api_key": key}
+
+class _ProvMgr:
+    def __init__(self, mapping):
+        self.mapping = mapping
+    def get_model_info(self, pid, mid):
+        return self.mapping.get(f"{pid}:{mid}")
+
+def p2b_provider_groups(mod):
+    """3.1.1 的 TypeSafe 决策模型（decision 分组）与旧 llm 组合同链；空值零变化。"""
+    llm = _ProvInfo("uuid-llm", "llm-readable", "https://llm.example/v1", "k1")
+    dec = _ProvInfo("uuid-dec", "jev-latest", "https://dec.example/v1", "k2")
+    dup = _ProvInfo("uuid-dup", "llm-readable", "https://llm.example/v1", "k1")  # 与 llm 档完全相同
+    mgr = _ProvMgr({"p:uuid-llm": llm, "p:uuid-dec": dec, "p:uuid-dup": dup})
+    out = {}
+
+    # (a) 旧配置（只有 llm 组）⇒ 与 2.7.4 完全一致
+    plug, _, _ = make_plugin(mod, {"section_jev": {"jev_models": ["p:uuid-llm"]}})
+    plug.ctx.provider_mgr = mgr
+    plug._jev_resolve_links()
+    out["P2b 仅 llm 组：链路与旧版一致"] = plug._jev_links == [
+        ("https://llm.example/v1", "k1", "llm-readable")]
+    out["P2b 仅 llm 组：显示名用 model_name"] = (
+        plug._jev_link_displays == ["llm-readable (测试商) ⇒ llm-readable@llm.example"])
+
+    # (b) 只选决策组也能用（新功能）
+    plug, _, _ = make_plugin(mod, {"section_jev": {"jev_decision_models": ["p:uuid-dec"]}})
+    plug.ctx.provider_mgr = mgr
+    plug._jev_resolve_links()
+    out["P2b 仅决策组：链路成立"] = plug._jev_links == [
+        ("https://dec.example/v1", "k2", "jev-latest")]
+
+    # (c) 两组都有 ⇒ 顺序 llm → decision
+    plug, _, _ = make_plugin(mod, {"section_jev": {
+        "jev_models": ["p:uuid-llm"], "jev_decision_models": ["p:uuid-dec"]}})
+    plug.ctx.provider_mgr = mgr
+    plug._jev_resolve_links()
+    out["P2b 两组顺序 llm→decision"] = plug._jev_links == [
+        ("https://llm.example/v1", "k1", "llm-readable"),
+        ("https://dec.example/v1", "k2", "jev-latest")]
+
+    # (d) 跨组重复档去重
+    plug, _, _ = make_plugin(mod, {"section_jev": {
+        "jev_models": ["p:uuid-llm"], "jev_decision_models": ["p:uuid-dup"]}})
+    plug.ctx.provider_mgr = mgr
+    plug._jev_resolve_links()
+    out["P2b 跨组重复去重"] = plug._jev_links == [
+        ("https://llm.example/v1", "k1", "llm-readable")]
+
+    # (e) aux_llm 只用 llm 组（决策模型不是 LLM，不能混进来）
+    plug, _, _ = make_plugin(mod, {"section_jev": {
+        "jev_models": ["p:uuid-llm"], "jev_decision_models": ["p:uuid-dec"]}})
+    plug.ctx.provider_mgr = mgr
+    seen = []
+    plug.ctx.get_llm_client = lambda model_uuid=None, **k: seen.append(model_uuid) or None
+    plug._jev_resolve_llm_clients()
+    out["P2b aux_llm 只取 llm 组"] = seen == ["p:uuid-llm"]
+
+    # (f) 旧版手动连接字段已从设置页移除，但旧配置仍必须生效
+    plug, _, _ = make_plugin(mod, {"section_jev": {
+        "jev_api_key": "sk-legacy", "jev_base_url": "https://legacy",
+        "jev_model_name": "jev-latest"}})
+    plug.ctx.provider_mgr = mgr
+    plug._jev_resolve_links()
+    out["P2b 旧手动配置已忽略（不隐形生效）"] = plug._jev_links == []
+
+    # (g) 两组各自 10 档：llm 满 10 也不会挤掉 decision
+    many = {("p", "uuid-dec"): dec}
+    refs = []
+    for i in range(10):
+        many[("p", "m%d" % i)] = _ProvInfo("m%d" % i, "m%d" % i, "https://llm%d.example/v1" % i, "k")
+        refs.append("p:m%d" % i)
+    plug, _, _ = make_plugin(mod, {"section_jev": {
+        "jev_models": refs, "jev_decision_models": ["p:uuid-dec"]}})
+    plug.ctx.provider_mgr = _ProvMgr({"%s:%s" % k: v for k, v in many.items()})
+    plug._jev_resolve_links()
+    out["P2b llm 满 10 不挤掉 decision"] = (
+        len(plug._jev_links) == 11 and plug._jev_links[-1][2] == "jev-latest")
+    return out
+
 # ---------------------------------------------------------------- P3/P4/P5 客户端
 async def p3_decide(jev):
     log = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None,
@@ -542,6 +629,8 @@ async def run(plugin_dir: Path):
     for label, cond in p1_endpoint(jev).items():
         check(label, cond)
     for label, cond in p2_config(jev).items():
+        check(label, cond)
+    for label, cond in p2b_provider_groups(mod).items():
         check(label, cond)
     for fn in (p3_decide, p4_breaker, p5_fallback_chain):
         for label, cond in (await fn(jev)).items():

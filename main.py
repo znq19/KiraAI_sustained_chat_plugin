@@ -202,10 +202,21 @@ class DebouncePlugin(BasePlugin):
             self.jev_backend = "jev"
         # 人格注入判定（默认开；关掉则 state 只有会话内容——旧行为）
         self.jev_persona_inject = bool(jev_sec.get("jev_persona_inject", True))
-        self.jev_models = [str(x) for x in (jev_sec.get("jev_models") or []) if str(x).strip()]
-        self.jev_base_url = str(jev_sec.get("jev_base_url") or "").strip()
-        self.jev_api_key = str(jev_sec.get("jev_api_key") or "").strip()
-        self.jev_model_name = str(jev_sec.get("jev_model_name") or "").strip()
+        _jm = jev_sec.get("jev_models") or []
+        self.jev_models = [str(x) for x in _jm if str(x).strip()] if isinstance(_jm, (list, tuple)) else []
+        # 3.1.1+：框架新增了专门的 TypeSafe 决策模型提供商（model_config.decision 分组）。
+        # 配置页一个模型字段只能绑定一个 model_type（框架限制），所以决策模型单独一组。
+        _jdm = jev_sec.get("jev_decision_models") or []
+        self.jev_decision_models = [
+            str(x) for x in _jdm if str(x).strip()
+        ] if isinstance(_jdm, (list, tuple)) else []
+        # 旧版手动连接字段已移除（3.1.1 起改用提供商注册）：旧配置一律**忽略**，绝不隐形生效
+        if str(jev_sec.get("jev_api_key") or "").strip():
+            logger.warning(
+                "[JEV] 检测到旧版手动连接配置（jev_base_url / jev_api_key / jev_model_name）："
+                "该方式已移除，配置已忽略、不再生效；请在「设置 → 提供商」注册 TypeSafe "
+                "或 OpenAI 兼容提供商，再在 JEV 模型组里选择。"
+            )
         self.jev_timeout = max(0.5, _safe_float(jev_sec.get("jev_timeout_ms"), 6000) / 1000.0)
         self.jev_min_confidence = _safe_float(jev_sec.get("jev_min_confidence"), 0.0)
         # 空停守望：停窗后，把停窗期间新积攒的消息批交 JEV 判断是否重新开口（续窗）。
@@ -1083,10 +1094,18 @@ class DebouncePlugin(BasePlugin):
     # ========== JEV 触发决策（可选，默认全关；全部后台执行，绝不阻塞消息管线） ==========
 
     def _jev_resolve_links(self) -> None:
-        """jev_models（webui 已注册提供商模型多选）→ [(base, key, model)] 有序回退链；
-        显式手动字段作最后兜底。displays 只含可读名与端点主机，**绝不含密钥**。"""
+        """jev_models / jev_decision_models → [(base, key, model)] 有序回退链；
+        displays 只含可读名与端点主机，**绝不含密钥**。
+
+        3.1.1 起框架有专门的 TypeSafe 决策模型提供商：决策模型注册在 provider 的
+        `model_config.decision` 分组，与 llm 分组不同；而配置页一个模型字段只能绑定
+        一个 model_type ⇒ 这里用两个多选分别收集，按「llm 组 → 决策组」合并
+        成同一条有序回退链（两组都为空 = 旧行为，逐字节不变）。
+        """
         links, displays = [], []
-        for ref in self.jev_models[:10]:
+        # 两组各自 ≤10 档（合计 ≤20）：不能因为填满一组就把另一组静默丢掉
+        refs = self.jev_models[:10] + self.jev_decision_models[:10]
+        for ref in refs:
             pid, mid = _jev_mod.split_ref(ref)
             if not pid or not mid:
                 continue
@@ -1112,15 +1131,6 @@ class DebouncePlugin(BasePlugin):
             name = getattr(info, "model_name", None) or mid
             provider = getattr(info, "provider_name", "") or pid
             displays.append(f"{name} ({provider}) ⇒ {model}@{host}")
-        # 显式手动兜底（密钥非空才成链）
-        if self.jev_api_key:
-            base = self.jev_base_url or _jev_mod.DEFAULT_BASE_URL
-            model = self.jev_model_name or _jev_mod.DEFAULT_MODEL
-            link = (base, self.jev_api_key, model)
-            if link not in links:
-                links.append(link)
-                host = base.split("://", 1)[-1].split("/", 1)[0]
-                displays.append(f"手动 ⇒ {model}@{host}")
         self._jev_links = links
         self._jev_link_displays = displays
 
@@ -1128,8 +1138,7 @@ class DebouncePlugin(BasePlugin):
         """aux_llm 后端：jev_models 引用 → [(ref, LLMModelClient)] 有序回退链。
 
         双世代同构：`ctx.get_llm_client(model_uuid="provider:model")`（2.x/3.0 同签名）。
-        解析失败/拿不到的档跳过（记日志）；手动兜底三字段仅 JEV 后端用（小模型模式
-        请用模型组下拉选择 webui 已注册模型）。
+        解析失败/拿不到的档跳过（记日志）；aux_llm 只用 llm 组（决策模型不是 LLM）。
         """
         clients, displays = [], []
         for ref in self.jev_models[:10]:
@@ -1178,7 +1187,13 @@ class DebouncePlugin(BasePlugin):
                         logger.info(f"[JEV·LLM] 小模型判官链路（生成式，延迟/成本高于 JEV）: "
                                     f"{' → '.join(self._jev_link_displays)}")
                     else:
-                        logger.warning("[JEV·LLM] 已启用但没有可用模型（模型组为空），JEV 不生效")
+                        if self.jev_decision_models and not self.jev_models:
+                            logger.warning(
+                                "[JEV·LLM] 只选了 TypeSafe 决策模型组：aux_llm 后端不能用决策模型，"
+                                "请改用 jev 后端，或另选 llm 模型组。"
+                            )
+                        else:
+                            logger.warning("[JEV·LLM] 已启用但没有可用模型（模型组为空），JEV 不生效")
             if not getattr(self, "_jev_llm_clients", None):
                 return None
             self._jev_client = _jev_mod.LlmJudgeClient(
@@ -1195,7 +1210,7 @@ class DebouncePlugin(BasePlugin):
                 if self._jev_links:
                     logger.info(f"[JEV] 决策链路: {' → '.join(self._jev_link_displays)}")
                 else:
-                    logger.warning("[JEV] 已启用但没有可用链路（模型组为空且手动兜底未填），JEV 不生效")
+                    logger.warning("[JEV] 已启用但没有可用链路（模型组为空），JEV 不生效")
         if not self._jev_links:
             return None
         cfg = _jev_mod.JevConfig(enabled=True, links=self._jev_links,

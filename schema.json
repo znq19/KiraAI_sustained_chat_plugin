@@ -515,33 +515,23 @@
           "jev",
           "aux_llm"
         ],
-        "hint": "jev=TypeSafe System-One 决策模型（推荐：不生成文本，输入 $0.042/MTok、输出免费、70~500ms）；aux_llm=用「设置→提供商」里已注册的小模型做同样判断（生成式路径：延迟秒级、输入输出都计费、置信度由模型自报仅供卡阈）。aux_llm 时下方手动兜底三字段不适用，请用模型组下拉选模型。"
+        "hint": "jev=TypeSafe System-One 决策模型（推荐：不生成文本，输入 $0.042/MTok、输出免费、70~500ms）；aux_llm=用「设置→提供商」里已注册的小模型做同样判断（生成式路径：延迟秒级、输入输出都计费、置信度由模型自报仅供卡阈）。aux_llm 时请用「JEV 模型组（OpenAI 兼容）」选择已注册的小模型。"
       },
       "jev_models": {
         "type": "multi_select",
         "source": "model",
         "model_type": "llm",
-        "name": "JEV 模型组（推荐 · 有序回退）",
+        "name": "JEV 模型组（OpenAI 兼容 / 有序回退）",
         "default": [],
-        "hint": "先在「设置 → 提供商」把 JEV 当中转提供商注册（接口地址+密钥，加一个叫 jev-latest 的模型），然后在这里按点击顺序挑选 1~10 个：接口地址/密钥/模型名自动继承，失败自动换下一个。留空则用下方手动填写的地址与密钥。"
+        "hint": "先在「设置 → 提供商」把 JEV 当中转提供商注册（OpenAI 兼容格式：接口地址 + 密钥，加一个叫 jev-latest 的 llm 模型），然后在这里按点击顺序挑选 1~10 个：接口地址/密钥/模型名自动继承，失败自动换下一个。3.1.1+ 用内置 TypeSafe 决策提供商时请用下面那一组。本组留空不影响决策组；两组都为空时 JEV 不启用。"
       },
-      "jev_base_url": {
-        "type": "string",
-        "name": "JEV 接口地址（手动兜底）",
-        "default": "https://api.typesafe.ai",
-        "hint": "上方模型组为空时才用这里。官方 https://api.typesafe.ai；部分地区官方不可用时填中转站地址。支持粘贴 .../v1、.../v1/systemone 等完整地址，插件自动规整。"
-      },
-      "jev_api_key": {
-        "type": "string",
-        "name": "JEV API 密钥（手动兜底）",
-        "default": "",
-        "hint": "上方模型组为空时才用这里。支持 $$环境变量名 形式。"
-      },
-      "jev_model_name": {
-        "type": "string",
-        "name": "JEV 模型名（手动兜底）",
-        "default": "jev-latest",
-        "hint": "上方模型组为空时才用这里。官方别名 jev-latest 或固定版本号如 jev-1.13.0。"
+      "jev_decision_models": {
+        "type": "multi_select",
+        "source": "model",
+        "model_type": "decision",
+        "name": "JEV 决策模型组（TypeSafe · 3.1.1+）",
+        "default": [],
+        "hint": "KiraAI 3.1.1 起内置了 TypeSafe 决策模型提供商：在「设置 → 提供商」添加 TypeSafe（接口地址 https://api.typesafe.ai/v1 或你的中转），再添加一个叫 jev-latest 的 decision 模型，然后在这里按点击顺序挑选 1~10 个。与上面的「JEV 模型组」合并成同一条有序回退链（llm 组在前、本组在后）。"
       },
       "jev_timeout_ms": {
         "type": "integer",

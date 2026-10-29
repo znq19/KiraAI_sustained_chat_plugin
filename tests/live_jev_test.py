@@ -138,24 +138,32 @@ def _make_cfg():
                                 "agent": {"max_tool_loop": 2, "tool_call_timeout": 60}}})
 
 async def plugin_e2e(mod):
-    """插件 _jev_judge 全链路：手动兜底链路（base/key/model）→ 真 JEV。"""
+    """插件 _jev_judge 全链路：提供商链路（base/key/model）→ 真 JEV。"""
     buf = SimpleNamespace(buffer=[], get_length=lambda: 0,
                           pop=lambda count=1: [])
     proc = SimpleNamespace(flushed=[],
                            flush_session_messages=lambda sid, **k: asyncio.sleep(0),
                            get_session_buffer_length=lambda sid: 0)
+    class _Info:
+        provider_name = "实联"
+        model_name = MODEL
+        provider_config = {"base_url": BASE, "api_key": KEY}
+
+    class _Mgr:
+        def get_model_info(self, pid, mid):
+            return _Info() if (pid, mid) == ("live", "jev") else None
+
     ctx = SimpleNamespace(config=_make_cfg(), message_processor=proc,
                           get_buffer=lambda sid: buf,
                           get_plugin_data_dir=lambda: Path("/tmp"),
-                          provider_mgr=None)
+                          provider_mgr=_Mgr())
     cfg = {"section_basic": {}, "section_group_sustain": {}, "section_dm_sustain": {},
-           "section_jev": {"jev_enabled": True, "jev_base_url": BASE,
-                           "jev_api_key": KEY, "jev_model_name": MODEL,
+           "section_jev": {"jev_enabled": True, "jev_models": ["live:jev"],
                            "jev_timeout_ms": 15000}}
     plug = mod.DebouncePlugin(ctx, cfg)
     # 链路为懒解析（首次取客户端时构建），先取客户端再断言
     cli = plug._get_jev_client()
-    check("L5 手动兜底链路解析成链", cli is not None and len(plug._jev_links) == 1,
+    check("L5 提供商链路解析成链", cli is not None and len(plug._jev_links) == 1,
           str(plug._jev_link_displays))
     r = await plug._jev_judge("qq:gm:1", WATCH_REPLY_STATE, "watch")
     check("L5 插件 _jev_judge 全链路 ⇒ reply", r == "reply", str(r))

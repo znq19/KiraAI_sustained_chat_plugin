@@ -163,10 +163,28 @@ async def t3_guard_occupies_caption_when_pir_active(plugin_dir):
     check("T3 对照：已有 caption 不被覆盖", img2.caption == "已有描述", f"caption={img2.caption!r}")
 
 
+def t4_model_label(plugin_dir):
+    """识图日志必须显示人类可读模型名：3.x 的 model_id 是 uuid（用户认不出）。"""
+    mod = load_media(plugin_dir)
+    label = getattr(mod, "_model_label", None)
+    check("T4 _model_label 存在", callable(label))
+    if not callable(label):
+        return
+    # 3.x 形状：uuid + model_name ⇒ 取 model_name
+    check("T4 3.x 取 model_name",
+          label(SimpleNamespace(model_name="视觉模型A", model_id="f451aabc23ea5724")) == "视觉模型A")
+    # 2.x 形状：没有 model_name ⇒ 回落 model_id（旧输出不变）
+    check("T4 2.x 回落 model_id",
+          label(SimpleNamespace(model_id="gpt-4o")) == "gpt-4o")
+    # 空值/异常不得影响识别
+    check("T4 None 安全", label(None) == "?")
+
+
 SCENARIOS = [
     ("T1 占位污染免疫（_is_valid_desc）", t1_is_valid_desc),
     ("T2 缓存 upsert 带活 last_seen", t2_cache_set_upsert),
     ("T3 PIR 竞态窗口 guard 占位", t3_guard_occupies_caption_when_pir_active),
+    ("T4 识图日志显示可读模型名（3.x 非 uuid）", t4_model_label),
 ]
 
 
@@ -190,7 +208,6 @@ async def main():
     passed = sum(1 for _, ok in results if ok)
     print("TOTAL %d/%d passed" % (passed, len(results)))
     return 0 if passed == len(results) else 1
-
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))

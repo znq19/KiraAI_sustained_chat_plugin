@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.4
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.7.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -286,7 +286,11 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 - **评分互洽**：JEV 否决时把评分门 boost 已清的分**回补到快照**（单调不减，期间新攒的分不丢）；弃权/失败/熔断一律回退机械逻辑——JEV 挂了，行为和没装它一模一样
 - **零阻塞**：全部后台任务执行，消息管线从头到尾不等网络
 
-**模型配置**：在「设置 → 提供商」注册 JEV 中转（或官方），回本插件的 `section_jev` 下拉多选模型（自动继承地址/密钥，有序回退链，≤10 档）；也可手动填地址+密钥兜底。没有 JEV 渠道？`jev_backend=aux_llm` 直接拿你 webui 里已注册的**任意小模型**当判官（生成式路径，延迟秒级、输入输出都计费，配置页有明示）。
+**模型配置**：两种注册方式二选一（也可都配，按「llm 组 → 决策组 → 手动」顺序回退）：
+- **3.1.1+ 推荐**：在「设置 → 提供商」添加内置 **TypeSafe** 提供商（接口地址 `https://api.typesafe.ai/v1` 或中转），加一个叫 `jev-latest` 的 **decision** 模型 → 回插件在「JEV 决策模型组」里多选；
+- **OpenAI 兼容中转**：把 JEV 注册成 **OpenAI** 提供商（base_url 带 `/v1`），加一个 `jev-latest` 的 llm 模型 → 在「JEV 模型组」里多选。
+
+两组都自动继承地址/密钥，有序回退链合计 ≤10 档。旧版手动填地址/密钥/模型名已移除，旧值忽略。没有 JEV 渠道？`jev_backend=aux_llm` 直接拿你 webui 里已注册的**任意小模型**当判官（生成式路径，延迟秒级、输入输出都计费，配置页有明示）。
 
 ⚠ 提示词（守望/触发指令）与最低置信度均可自定义；消息内容会发给 JEV 提供商（可为中转站），介意勿开。
 
@@ -371,6 +375,19 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.7.5
+
+- **适配 KiraAI 3.1.1 新增的 TypeSafe 决策模型提供商**：框架把决策模型放在 provider 的
+  `model_config.decision` 分组，而配置页一个模型字段只能绑定一个 `model_type`（框架限制）⇒
+  新增独立的多选「JEV 决策模型组（TypeSafe · 3.1.1+）」，与原有「JEV 模型组（OpenAI 兼容）」
+  按「llm 组 → 决策组 → 手动」合并成同一条有序回退链。两组都留空 = 旧行为逐字节不变。
+- **移除旧版手动 JEV 连接配置**：`jev_base_url` / `jev_api_key` / `jev_model_name` 不再出现在设置页；
+  旧值一律**忽略**（启动日志会提示），请改用「提供商 + JEV 模型组」。
+- **修复图片识别日志显示内部 uuid**：`[MediaRecognize:*] Describing image using …` 在 3.x 打印的是
+  `model_id`（uuid），改为优先人类可读的 `model_name`；2.x 无 `model_name` 时回落 `model_id`，旧行为不变。
+- 测试：新增决策模型组链路/空值等价/日志模型名用例；既有全套件全绿
+- 版本 2.7.4 → 2.7.5
 
 ### v2.7.4
 

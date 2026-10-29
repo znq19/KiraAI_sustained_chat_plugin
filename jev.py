@@ -18,7 +18,7 @@
   · 零依赖：urllib 同步实现跑在 asyncio.to_thread（可硬超时）；
   · 熔断：连续失败 3 次 → 冷却 300s（每次失败重新计时）；冷却中直接返回 None；
   · 端点规整：容忍用户粘贴 .../v1、.../v1/systemone、.../v1/chat/completions 等；
-  · 有序回退链：webui 已注册提供商模型多选（自动继承地址/密钥/模型名）+ 手动兜底；
+  · 有序回退链：webui 已注册提供商模型多选（自动继承地址/密钥/模型名）；
   · 任何失败都返回 None（上层回退机械逻辑），绝不外泄异常、绝不阻塞消息管线。
 """
 from __future__ import annotations
@@ -153,7 +153,7 @@ class JevConfig:
 
     links = [(base_url, api_key, model), ...] **有序回退链**：
       · 来自 webui 已注册提供商的模型多选（jev_models），自动继承接口地址/密钥/模型名；
-      · 末尾可追加手动填写的显式连接（jev_base_url/jev_api_key/jev_model_name）作兜底；
+      · 旧版手动连接字段已移除（3.1.1 起改用提供商注册）；
       · 缺地址或密钥的档在解析侧就被跳过（记日志），不会进链。
     """
 

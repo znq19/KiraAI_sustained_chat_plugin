@@ -61,6 +61,20 @@ try:
 except Exception:  # 极端兼容：拿不到框架日志器时退回插件 logger
     from core.plugin import logger
 
+
+def _model_label(model) -> str:
+    """模型的人类可读名：3.x 用 `model_name`，2.x 没有该属性时回落 `model_id`。
+
+    KiraAI 3.x 的 `model_id` 是内部 uuid（`f451aabc…`），直接打日志用户完全认不出；
+    2.x 的 `model_id` 本身就是模型名 ⇒ 回落保持旧输出不变。任何异常都不得影响识别。
+    """
+    try:
+        return (str(getattr(model, "model_name", "") or "").strip()
+                or str(getattr(model, "model_id", "") or "").strip()
+                or "?")
+    except Exception:
+        return "?"
+
 # 标识符匹配（内容三态：空 / 描述 / (未识别) (已过期)）
 _IMAGE_RE = re.compile(r"\[Image #([^\]\s:]+): ([^\]]*)\]")
 _RECORD_RE = re.compile(r"\[Record #([^\]\s:]+): ([^\]]*)\]")
@@ -1323,8 +1337,10 @@ class ParallelMediaRecognizer:
             # 日志（[MediaRecognize:prefetch|stage2|stage3]），便于对照排查谁在识图。
             try:
                 _mdl = vlm.model
+                # 3.x 的 model_id 是内部 uuid；日志必须显示人类可读的 model_name
+                # （2.x 没有 model_name 时才回落到 model_id，行为与旧版一致）
                 logger.info(
-                    f"[MediaRecognize:{source}] Describing image using {_mdl.model_id} ({_mdl.provider_name})"
+                    f"[MediaRecognize:{source}] Describing image using {_model_label(_mdl)} ({_mdl.provider_name})"
                 )
             except Exception:
                 pass
