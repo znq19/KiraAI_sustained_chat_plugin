@@ -77,6 +77,17 @@ def endpoint_of(base_url: str) -> str:
     return b + "/v1/systemone"
 
 
+def link_label(base_url: str, model: str) -> str:
+    """日志用链路标签：`模型名@主机`（绝不含密钥/完整路径）。
+
+    3.x 的 provider/model 内部 id 是 uuid，日志里直接打 `provider:model` 用户认不出；
+    JEV 链路本身拿得到上游 model_name 与 base_url 主机，统一用这个格式输出。
+    """
+    b = (base_url or "").strip()
+    host = b.split("://", 1)[-1].split("/", 1)[0] if b else "?"
+    return f"{model or '?'}@{host or '?'}"
+
+
 def _env(value: str) -> str:
     """支持 `$$ENV_NAME` 形式（与框架敏感配置一致）。"""
     v = (value or "").strip()
@@ -213,6 +224,7 @@ class JevClient:
         self.calls = 0           # 成功调用次数
         self.abstains = 0        # 低置信弃权次数
         self._http = None        # httpx.AsyncClient 惰性实例（无 httpx 时保持 None）
+        self.last_link = None    # 最近一次成功档 (base, model)，仅用于可读日志
 
     @property
     def model(self) -> str:
@@ -275,15 +287,21 @@ class JevClient:
                     endpoint_of(base),
                     json=body,
                     headers={"Authorization": "Bearer " + (key or "")},
+                    timeout=timeout,
                 )
                 if resp.status_code != 200:
                     hint = _HTTP_HINTS.get(resp.status_code, "上游错误")
                     raise RuntimeError(f"HTTP {resp.status_code}（{hint}）")
+                self.last_link = (base, model_name)
                 return resp.json()
             except Exception as exc:      # 逐档兜住，最后一档才抛
                 last_exc = exc
                 if len(self.links) > 1:
-                    self.logger.info("[JEV] 第 %d 档失败（%s）⇒ 换下一档", idx, type(exc).__name__)
+                    self.logger.info(
+                        "[JEV] 第 %d/%d 档 %s 失败（%s: %s）⇒ 换下一档",
+                        idx, len(self.links), link_label(base, model_name),
+                        type(exc).__name__, str(exc)[:120],
+                    )
         raise last_exc if last_exc else RuntimeError("jev_no_endpoint")
 
     # ---------- 同步实现 ----------
@@ -306,12 +324,31 @@ class JevClient:
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     raw = resp.read().decode("utf-8", "replace")
+                self.last_link = (base, model_name)
                 return json.loads(raw)
             except Exception as exc:      # 逐档兜住，最后一档才抛
                 last_exc = exc
                 if len(self.links) > 1:
-                    self.logger.info("[JEV] 第 %d 档失败（%s）⇒ 换下一档", idx, type(exc).__name__)
+                    self.logger.info(
+                        "[JEV] 第 %d/%d 档 %s 失败（%s: %s）⇒ 换下一档",
+                        idx, len(self.links), link_label(base, model_name),
+                        type(exc).__name__, str(exc)[:120],
+                    )
         raise last_exc if last_exc else RuntimeError("jev_no_endpoint")
+
+    async def aclose(self) -> None:
+        """关闭惰性 httpx 连接池（插件 terminate / 热重载时调用）。
+
+        不关闭会随每次热重载泄漏一个 AsyncClient（连接池 + 套接字）；
+        urllib 回退路径无持久资源，无需处理。可重入。
+        """
+        client = getattr(self, "_http", None)
+        self._http = None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     # ---------- 对外 ----------
     async def decide_trigger(self, state: str, instructions: str,
@@ -322,6 +359,7 @@ class JevClient:
         机械结果照旧，防止低置信抖动改变行为）。"""
         if not self.ready or not instructions:
             return None
+        self.last_link = None
         payload = {
             "model": self.model,
             "state": state or "",
@@ -355,6 +393,8 @@ class JevClient:
             "probabilities": probs,
             "model": str(data.get("model") or self.model),
         }
+        if self.last_link is not None:
+            result["via"] = link_label(self.last_link[0], self.last_link[1])
         if conf < self.min_confidence:
             self.abstains += 1
             result["_abstain"] = True
@@ -372,42 +412,54 @@ _LLM_JUDGE_SUFFIX = (
     "不要输出任何其他内容。"
 )
 
+#: 与 JEV 的 choice 题共用同一套判定标准（否则两条后端对同一场景的判读会漂移）。
+_LLM_CRITERIA_TEXT = "\n".join(f"- {k}：{v}" for k, v in TRIGGER_CRITERIA.items())
+
 
 def parse_llm_answer(text: str):
     """从小模型输出解析判定 → (choice|None, confidence)。
 
-    顺序：第一个 {...} JSON 块 → 关键词兜底（reply/wait 单词）→ None（解析失败）。
-    解析失败不猜——调用方换下一档或回退机械逻辑。
+    顺序：
+      1. 取**最后一个** {...} JSON 块（模型常先写推理/复述指令，最后一个才是答案；
+         旧实现取第一个，遇到嵌套/回显会读错）；
+      2. 严格整行兜底：只有整行恰好是 reply / wait（可带引号/句号）才认；
+      3. 否则 None（解析失败）。
+
+    ★ 旧实现用 `"reply" in text` 做关键词兜底：提供商错误文本、模型解释
+      （"I should wait for..."）都会被误判成有效判定，对 confirm 场景尤其危险
+      （错误文本可能否决一次机械命中）。判定解析必须宁缺毋滥。
     """
     if not text:
         return None, 0.0
     import re as _re
-    m = _re.search(r'\{[^{}]*\}', text, _re.S)
-    if m:
+    blocks = _re.findall(r'\{[^{}]*\}', text, _re.S)
+    for raw in reversed(blocks):
         try:
-            obj = json.loads(m.group(0))
-            choice = str(obj.get("choice") or "").strip().lower()
-            if choice in ("reply", "wait"):
-                try:
-                    conf = float(obj.get("confidence", 0.5))
-                except (TypeError, ValueError):
-                    conf = 0.5
-                return choice, min(1.0, max(0.0, conf))
+            obj = json.loads(raw)
         except Exception:
-            pass
-    low = text.strip().lower()
-    if "reply" in low:
-        return "reply", 0.5
-    if "wait" in low:
-        return "wait", 0.5
+            continue
+        if not isinstance(obj, dict):
+            continue
+        choice = str(obj.get("choice") or "").strip().lower()
+        if choice in ("reply", "wait"):
+            try:
+                conf = float(obj.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                conf = 0.5
+            return choice, min(1.0, max(0.0, conf))
+    # 严格整行兜底（不扫描任意子串）
+    m = _re.search(r'(?im)^\s*["\']?(reply|wait)["\']?\s*[.!。！]?\s*$', text)
+    if m:
+        return m.group(1).lower(), 0.5
     return None, 0.0
 
 
 class LlmJudgeClient:
     """小模型判官客户端：接口与 JevClient 对齐（decide_trigger / ready / 熔断 / 记账）。
 
-    clients = [(ref, LLMModelClient)] 有序回退链：仅**异常或解析失败**才换下一档
-    （能解析出结论的回复是有效答案，不触发回退——与 KPP trigger 同语义）。
+    clients = [(label, LLMModelClient)] 有序回退链：label 是**人类可读的
+    「模型名 (提供商名)」**（由宿主解析，绝不传 provider:model 的 uuid 引用）；
+    仅**异常或解析失败**才换下一档（能解析出结论的回复是有效答案，不触发回退）。
     """
 
     COOLDOWN = 300.0
@@ -415,7 +467,8 @@ class LlmJudgeClient:
     def __init__(self, clients, timeout: float, min_confidence: float, logger):
         self.clients = [(r, c) for r, c in (clients or []) if c is not None]
         self.timeout = max(1.0, float(timeout))
-        self.min_confidence = float(min_confidence)
+        # 与 JevConfig 同口径：置信度阈值钳制到 0~1，避免配置成 2 时永远弃权
+        self.min_confidence = max(0.0, min(1.0, float(min_confidence)))
         self.logger = logger
         self.fails = 0
         self.opened_at = 0.0
@@ -456,30 +509,46 @@ class LlmJudgeClient:
                 self.logger.warning("[JEV·LLM] 连续失败 3 次，冷却 300 秒（期间自动回退机械逻辑）")
 
     async def _chat_one(self, client, prompt: str, timeout: float) -> str:
-        """调一档小模型（import 延迟到调用时，保持本模块零框架依赖）。"""
+        """调一档小模型（import 延迟到调用时，保持本模块零框架依赖）。
+
+        `LLMResponse.status == "error"` 必须按失败处理：框架把所有 provider 全挂时
+        返回的是错误文本（不是模型答案），若把它当普通文本解析，错误描述里出现
+        "wait"/"reply" 就可能被误判成有效判定（旧版 parse 的宽松关键词兜底尤其危险）。
+        """
         from core.provider import LLMRequest
         req = LLMRequest(messages=[{"role": "user", "content": prompt}])
         resp = await asyncio.wait_for(client.chat(req), timeout=timeout)
+        if str(getattr(resp, "status", "success") or "success").lower() == "error":
+            detail = (getattr(resp, "text_response", "") or "")[:120]
+            raise RuntimeError(f"llm_error:{detail}")
         return (getattr(resp, "text_response", "") or "").strip()
 
     async def decide_trigger(self, state: str, instructions: str,
                              timeout: Optional[float] = None) -> Optional[dict]:
-        """→ {"choice","confidence","model","_backend":"aux_llm"}；失败/熔断 → None。"""
+        """→ {"choice","confidence","model","via","_backend":"aux_llm"}；失败/熔断 → None。"""
         if not self.ready or not instructions:
             return None
-        prompt = (instructions or "") + _LLM_JUDGE_SUFFIX + "\n\n对话内容：\n" + (state or "")
+        # 与 JEV 后端共用 TRIGGER_CRITERIA：自定义 instructions 只补充场景说明，
+        # reply/wait 的判定标准不能只存在于 JEV 的 questions 里（否则 aux 后端漂移）。
+        prompt = (
+            (instructions or "")
+            + "\n\n判定标准：\n" + _LLM_CRITERIA_TEXT
+            + _LLM_JUDGE_SUFFIX + "\n\n对话内容：\n" + (state or "")
+        )
         limit = float(timeout or self.timeout)
         last_exc = None
-        for idx, (ref, client) in enumerate(self.clients, 1):
+        for idx, (label, client) in enumerate(self.clients, 1):
             try:
                 text = await self._chat_one(client, prompt, limit)
                 choice, conf = parse_llm_answer(text)
                 if choice is None:
-                    raise ValueError(f"unparseable_answer:{text[:60]!r}")
+                    # 只记长度，不回显模型原文（可能包含用户对话内容/人格片段）
+                    raise ValueError(f"unparseable_answer(len={len(text)})")
                 self._ok()
                 self.calls += 1
                 result = {"choice": choice, "confidence": conf,
-                          "probabilities": {}, "model": f"llm:{ref}", "_backend": "aux_llm"}
+                          "probabilities": {}, "model": f"llm:{label}",
+                          "via": label, "_backend": "aux_llm"}
                 if conf < self.min_confidence:
                     self.abstains += 1
                     result["_abstain"] = True
@@ -487,8 +556,13 @@ class LlmJudgeClient:
             except Exception as exc:
                 last_exc = exc
                 if len(self.clients) > 1:
-                    self.logger.info("[JEV·LLM] 第 %d 档失败（%s）⇒ 换下一档", idx, type(exc).__name__)
+                    self.logger.info(
+                        "[JEV·LLM] 第 %d/%d 档 %s 失败（%s: %s）⇒ 换下一档",
+                        idx, len(self.clients), label,
+                        type(exc).__name__, str(exc)[:120],
+                    )
         self._bad(str(last_exc) if last_exc else "no_clients")
-        self.logger.info("[JEV·LLM] 判断未成功（%s），本轮走机械回退",
-                         type(last_exc).__name__ if last_exc else "?")
+        self.logger.info("[JEV·LLM] 判断未成功（%s: %s），本轮走机械回退",
+                         type(last_exc).__name__ if last_exc else "?",
+                         str(last_exc)[:120] if last_exc else "")
         return None

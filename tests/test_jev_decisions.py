@@ -24,7 +24,9 @@ import asyncio
 import importlib.util
 import json
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,6 +131,7 @@ def _msg(mid, text, nick="n"):
                            chain=[_text_elem(text)])
 
 SID = "qq:gm:10001"
+DMSID = "qq:dm:10002"
 
 def make_plugin(mod, extra_cfg=None):
     buf = _Buf()
@@ -360,6 +363,105 @@ async def p5_fallback_chain(jev):
     return {"P5 第 1 档失败换第 2 档": ok1 and ok2,
             "P5 换档后判定成功": r is not None and r["choice"] == "reply"}
 
+# ---------------------------------------------------------------- P6：两组模型真实 HTTP 链路
+async def p6_both_provider_groups(mod, jev):
+    """llm 组（OpenAI 注册）与 decision 组（TypeSafe）都能真实跑通。
+
+    起两个本地 HTTP 服务模拟 /v1/systemone：
+      · 第一个成功 = OpenAI 注册的 JEV；验证请求 model/Authorization/路径；
+      · 第二个成功 = TypeSafe decision 组；验证 llm 档失败时回退到 decision。
+    """
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n).decode())
+            self.server.calls.append(
+                (self.path, body, self.headers.get("Authorization")))
+            if self.server.fail:
+                self.send_response(500)
+                self.end_headers()
+                return
+            out = {
+                "model": body.get("model", "?"),
+                "answers": {"trigger": {"type": "choice", "choice": "reply",
+                                        "confidence": 0.9,
+                                        "probabilities": {"reply": 0.9, "wait": 0.1}}},
+                "usage": {"input_tokens": 12},
+            }
+            data = json.dumps(out).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    def serve(fail=False):
+        s = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        s.fail = fail
+        s.calls = []
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        return s
+
+    ok = serve(False)
+    bad = serve(True)
+    log = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None,
+                          debug=lambda *a, **k: None)
+    try:
+        # 1) OpenAI 注册的 llm 组：直接成功
+        plug, _, _ = make_plugin(mod, {"section_jev": {
+            "jev_models": ["openai:m1"],
+            "jev_decision_models": ["typesafe:m2"],
+        }})
+        plug.ctx.provider_mgr = _ProvMgr({
+            "openai:m1": _ProvInfo("m1", "jev-latest",
+                                   f"http://127.0.0.1:{ok.server_port}/v1",
+                                   "sk-openai", "OpenAI"),
+            "typesafe:m2": _ProvInfo("m2", "jev-latest",
+                                     f"http://127.0.0.1:{bad.server_port}/v1",
+                                     "sk-typesafe", "TypeSafe"),
+        })
+        plug._jev_resolve_links()
+        cli = jev.JevClient(plug._jev_links, 2.0, 0.0, log)
+        r = await cli.decide_trigger("用户：在吗", "判断")
+        ok_call = ok.calls[-1] if ok.calls else None
+        check("P6 llm 组（OpenAI 注册）可跑通", r and r["choice"] == "reply")
+        check("P6 llm 组请求路径 /v1/systemone",
+              ok_call and ok_call[0] == "/v1/systemone")
+        check("P6 llm 组请求模型名/密钥",
+              ok_call and ok_call[1].get("model") == "jev-latest"
+              and ok_call[2] == "Bearer sk-openai")
+
+        # 2) llm 档失败 → decision 组（TypeSafe）成功
+        plug2, _, _ = make_plugin(mod, {"section_jev": {
+            "jev_models": ["openai:m1"],
+            "jev_decision_models": ["typesafe:m2"],
+        }})
+        plug2.ctx.provider_mgr = _ProvMgr({
+            "openai:m1": _ProvInfo("m1", "jev-latest",
+                                   f"http://127.0.0.1:{bad.server_port}/v1",
+                                   "sk-openai", "OpenAI"),
+            "typesafe:m2": _ProvInfo("m2", "jev-latest",
+                                     f"http://127.0.0.1:{ok.server_port}/v1",
+                                     "sk-typesafe", "TypeSafe"),
+        })
+        plug2._jev_resolve_links()
+        cli2 = jev.JevClient(plug2._jev_links, 2.0, 0.0, log)
+        r2 = await cli2.decide_trigger("用户：在吗", "判断")
+        last = ok.calls[-1] if ok.calls else None
+        check("P6 llm 档失败回退 decision 组", r2 and r2["choice"] == "reply")
+        check("P6 decision 组请求用 TypeSafe 密钥",
+              last and last[2] == "Bearer sk-typesafe")
+        check("P6 两组合并顺序 llm→decision",
+              [x[2] for x in plug2._jev_links] == ["jev-latest", "jev-latest"]
+              and "OpenAI" in plug2._jev_link_displays[0]
+              and "TypeSafe" in plug2._jev_link_displays[1])
+    finally:
+        ok.shutdown()
+        bad.shutdown()
+    return {}
+
 # ---------------------------------------------------------------- M1/M2 宿主静态
 def m1_mode_table(mod):
     f = mod.DebouncePlugin._jev_mode_has
@@ -456,19 +558,78 @@ async def w1_watch_reply(mod):
     }
 
 async def w2_watch_wait(mod):
+    """wait ⇒ 维持停窗并结束本次守望（一次性），不再反复判后续批次。"""
     plug, buf, proc = make_plugin(mod, {"section_group_sustain": {"sustain_enabled": True}})
-    plug._jev_client = _FakeJevClient([{"choice": "wait", "confidence": 0.95,
-                                        "probabilities": {}, "model": "m"}])
+    fake = _FakeJevClient([
+        {"choice": "wait", "confidence": 0.95, "probabilities": {}, "model": "m"},
+        {"choice": "reply", "confidence": 0.95, "probabilities": {}, "model": "m"},
+    ])
+    plug._jev_client = fake
     plug.jev_watch_enabled = True
     plug.sustain_stopped[SID] = True
     plug._arm_watch_after_empty_stop(SID)
     buf.buffer.append(SimpleNamespace(message=_msg("n1", "哈哈哈哈")))
     gen = plug._watch_gen.get(SID, 0)
     await plug._watch_fire(SID, gen)
+    # 后续新消息：守望已解除，不得再触发 JEV
+    m2 = _msg("n2", "又一条")
+    buf.buffer.append(SimpleNamespace(message=m2))
+    plug._watch_track(SID, SimpleNamespace(message=m2))
+    await asyncio.sleep(0.05)
     return {
         "W2 wait ⇒ 不 flush": proc.flushed == [],
         "W2 wait ⇒ 闩保持": plug.sustain_stopped.get(SID, False) is True,
-        "W2 wait ⇒ 冷却登记": plug._watch_cooldown_until.get(SID, 0) > time.time(),
+        "W2 wait ⇒ 立即解除守望": not plug._watch_active(SID),
+        "W2 后续批次不再判": fake.calls == 1,
+        "W2 后续消息留在缓冲": len(buf.buffer) == 2,
+    }
+
+async def w4_watch_full_immediate(mod):
+    """满 max_buffer_messages 必须立即判，不能白等 merge_window。"""
+    plug, buf, proc = make_plugin(mod, {
+        "section_basic": {"merge_window_seconds": 30},
+        "section_group_sustain": {"sustain_enabled": True},
+    })
+    plug.max_buffer_messages = 2
+    fake = _FakeJevClient([{"choice": "reply", "confidence": 0.9,
+                            "probabilities": {}, "model": "m"}])
+    plug._jev_client = fake
+    plug.jev_watch_enabled = True
+    plug.sustain_stopped[SID] = True
+    plug._arm_watch_after_empty_stop(SID)
+    for mid in ("n1", "n2"):
+        m = _msg(mid, "消息" + mid)
+        buf.buffer.append(SimpleNamespace(message=m))
+        plug._watch_track(SID, SimpleNamespace(message=m))
+    await asyncio.sleep(0.15)          # 远小于 30s 窗口
+    return {
+        "W4 满即推立即调用 JEV": fake.calls == 1,
+        "W4 满即推立即 flush": proc.flushed == [SID],
+        "W4 reply 后解除守望": not plug._watch_active(SID),
+    }
+
+async def w5_watch_none_once(mod):
+    """JEV 失败/弃权（None）也按一次性处理：保持停窗、解除守望，不反复重试。"""
+    plug, buf, proc = make_plugin(mod, {"section_group_sustain": {"sustain_enabled": True}})
+    fake = _FakeJevClient([None, {"choice": "reply", "confidence": 0.9,
+                                  "probabilities": {}, "model": "m"}])
+    plug._jev_client = fake
+    plug.jev_watch_enabled = True
+    plug.sustain_stopped[SID] = True
+    plug._arm_watch_after_empty_stop(SID)
+    m = _msg("n1", "在吗")
+    buf.buffer.append(SimpleNamespace(message=m))
+    gen = plug._watch_gen.get(SID, 0)
+    await plug._watch_fire(SID, gen)
+    m2 = _msg("n2", "又一条")
+    buf.buffer.append(SimpleNamespace(message=m2))
+    plug._watch_track(SID, SimpleNamespace(message=m2))
+    await asyncio.sleep(0.05)
+    return {
+        "W5 弃权 ⇒ 不 flush": proc.flushed == [],
+        "W5 弃权 ⇒ 闩保持": plug.sustain_stopped.get(SID, False) is True,
+        "W5 弃权 ⇒ 解除守望": not plug._watch_active(SID),
+        "W5 弃权后不再判": fake.calls == 1,
     }
 
 async def w3_watch_disarm_on_wake(mod):
@@ -483,6 +644,43 @@ async def w3_watch_disarm_on_wake(mod):
     plug._watch_disarm(SID)
     return {"W3 武装时 active": ok0,
             "W3 真唤醒解闩后不再 active": not plug._watch_active(SID)}
+
+async def d7_deferred_aborts_on_stop(mod):
+    """判定期间发生停窗 ⇒ 放弃本次触发并回补评分（否则 JEV 延迟会让停止失效）。"""
+    plug, buf, proc = make_plugin(mod, {"section_group_sustain": {"sustain_enabled": True}})
+    m = _msg("m1", "x")
+    buf.buffer.append(SimpleNamespace(message=m))
+
+    class _StopJudge:
+        ready = True
+        async def decide_trigger(self, state, instructions, timeout=None):
+            plug.sustain_stopped[SID] = True      # 模拟判定期间 AI 空消息停窗
+            return {"choice": "reply", "confidence": 0.9,
+                    "probabilities": {}, "model": "m"}
+    plug._jev_client = _StopJudge()
+    pres = plug.enhance._get_presence(False)
+    pres._scores[SID] = 0.0                   # 模拟 boost 已清零
+    await plug._jev_deferred_trigger(SID, "m1", "proactive", True, score_snapshot=50.0)
+    return {
+        "D7 停窗竞态不 flush": proc.flushed == [],
+        "D7 停窗竞态回补评分": pres.score(SID, None) == 50.0,
+    }
+
+async def d8_deferred_aborts_when_flushed(mod):
+    """判定期间消息被真唤醒 flush 走 ⇒ 不再重复 flush。"""
+    plug, buf, proc = make_plugin(mod, {"section_group_sustain": {"sustain_enabled": True}})
+    m = _msg("m1", "x")
+    buf.buffer.append(SimpleNamespace(message=m))
+
+    class _FlushJudge:
+        ready = True
+        async def decide_trigger(self, state, instructions, timeout=None):
+            buf.buffer.clear()                    # 模拟真唤醒批次已把消息送走
+            return {"choice": "reply", "confidence": 0.9,
+                    "probabilities": {}, "model": "m"}
+    plug._jev_client = _FlushJudge()
+    await plug._jev_deferred_trigger(SID, "m1", "proactive", True)
+    return {"D8 消息已被 flush ⇒ 不重复 flush": proc.flushed == []}
 
 # ---------------------------------------------------------------- L 系：小模型判官（aux_llm 后端）
 class _FakeLLM:
@@ -506,8 +704,14 @@ async def l1_llm_parse_and_chain(jev):
     oks = [
         p('{"choice":"reply","confidence":0.9}')[0] == "reply",
         p('……\n{"choice":"wait","confidence":0.2}\n……')[0] == "wait",
-        p('I choose to reply now') == ("reply", 0.5),
-        p('wait 一下')[0] == "wait",
+        # 旧版宽松关键词兜底已移除：解释性/错误文本不能被当成判定
+        p('I choose to reply now')[0] is None,
+        p('wait 一下')[0] is None,
+        # 整行恰好 reply/wait 才认（可带引号/句号）
+        p('  "wait"  ') == ("wait", 0.5),
+        p('reply.') == ("reply", 0.5),
+        # 最后一个 JSON 块才是答案（前面可能是推理/回显）
+        p('我先想想 {"choice":"wait"} 最终 {"choice":"reply","confidence":0.8}')[0] == "reply",
         p('胡说八道没有答案')[0] is None,
         p('{"choice":"reply","confidence":"bad"}')[1] == 0.5,
         p('{"choice":"reply","confidence":9}')[1] == 1.0,   # clamp
@@ -531,9 +735,11 @@ async def l1_llm_parse_and_chain(jev):
     fail_ok = r3 is None and cli3.fails == 1
     return {
         "L1 解析：JSON块": oks[0], "L1 解析：噪声包裹": oks[1],
-        "L1 解析：关键词兜底 reply": oks[2], "L1 解析：关键词兜底 wait": oks[3],
-        "L1 解析：无答案 None": oks[4], "L1 解析：坏置信度回落0.5": oks[5],
-        "L1 解析：置信度钳制": oks[6],
+        "L1 解析：解释文本不猜 reply": oks[2], "L1 解析：解释文本不猜 wait": oks[3],
+        "L1 解析：严格整行 wait": oks[4], "L1 解析：严格整行 reply": oks[5],
+        "L1 解析：取最后一个 JSON 块": oks[6],
+        "L1 解析：无答案 None": oks[7], "L1 解析：坏置信度回落0.5": oks[8],
+        "L1 解析：置信度钳制": oks[9],
         "L1 解析失败自动换档": chain_ok, "L1 低置信弃权": abstain_ok,
         "L1 全档失败 None 且计熔断": fail_ok,
     }
@@ -557,8 +763,38 @@ async def l2_backend_dispatch(mod, jev):
     plug2, _, _ = make_plugin(mod)
     plug2.jev_backend = "jev"
     ok3 = plug2._get_jev_client() is None
+    ok4 = "小模型" in str(r.get("model") if r else "")
+    ok5 = "prov:m1" not in str(r.get("model") if r else "")
     return {"L2 aux_llm 分派出 LlmJudgeClient": ok1, "L2 小模型判定可用": bool(ok2),
-            "L2 jev 后端无链路透 None": ok3}
+            "L2 jev 后端无链路透 None": ok3,
+            "L2 判定模型名可读": ok4, "L2 判定模型名不含 uuid 引用": ok5}
+
+class _PromptLLM:
+    """记录请求 prompt 的假小模型；可指定 status=error。"""
+    def __init__(self, text, status="success"):
+        self.text = text
+        self.status = status
+        self.prompts = []
+    async def chat(self, req, **kw):
+        self.prompts.append(req.messages[0]["content"])
+        return SimpleNamespace(text_response=self.text, status=self.status)
+
+async def l3_aux_error_and_criteria(jev):
+    log = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None,
+                          debug=lambda *a, **k: None)
+    bad = _PromptLLM("[ProviderError] upstream timeout, please wait", status="error")
+    good = _PromptLLM('{"choice":"reply","confidence":0.8}', status="success")
+    cli = jev.LlmJudgeClient([("坏模型 (测试商)", bad), ("好模型 (测试商)", good)],
+                             3.0, 0.0, log)
+    r = await cli.decide_trigger("用户：在吗", "判断")
+    prompt = good.prompts[0] if good.prompts else ""
+    return {
+        "L3 error 响应触发换档": bad.prompts and good.prompts and r is not None,
+        "L3 error 文本不被当判定": r is not None and r.get("choice") == "reply",
+        "L3 aux 包含共用判定标准": "reply：" in prompt and "wait：" in prompt,
+        "L3 aux 结果 model/via 可读": r is not None
+            and "好模型 (测试商)" in str(r.get("model")) and r.get("via") == "好模型 (测试商)",
+    }
 
 # ---------------------------------------------------------------- R 系：评分快照/回补
 async def r1_refund_on_veto(mod):
@@ -623,6 +859,104 @@ def sc_scope_table(mod):
     out["SC 非法值按 ai_stop 行为"] = plug._watch_scope_allows("ai_keyword") is False
     return out
 
+# ---------------------------------------------------------------- MT 系：禁言 / 私聊守望
+async def mt1_mute_notice(mod):
+    """QQ增强禁言 notice ⇒ 静默；禁言期间不武装守望；解除 notice 恢复。"""
+    plug, buf, proc = make_plugin(mod, {"section_group_sustain": {"sustain_enabled": True}})
+    plug.jev_enabled = True
+    plug.jev_watch_enabled = True
+
+    class _Ev:
+        is_notice = True
+        def is_group_message(self): return True
+        session = SimpleNamespace(sid=SID)
+        message = SimpleNamespace(chain=[_text_elem("[System 用户x 禁言了你120秒]")])
+
+    plug._note_mute_notice(_Ev())
+    ok1 = plug._is_muted(SID)
+    plug.sustain_stopped[SID] = True
+    plug._arm_watch_after_empty_stop(SID)
+    ok2 = not plug._watch_active(SID)
+
+    _Ev.message.chain = [_text_elem("[System 你之前被禁言了，用户x解除了你的禁言]")]
+    plug._note_mute_notice(_Ev())
+    ok3 = not plug._is_muted(SID)
+    return {"MT1 禁言 notice 生效": ok1, "MT1 禁言期间不武装守望": ok2,
+            "MT1 解除 notice 恢复": ok3}
+
+async def mt2_send_failure_fallback(mod):
+    """没收到禁言通知时，发送失败 err 兜底进入静默。"""
+    plug, _, _ = make_plugin(mod)
+    plug._clear_muted(SID)
+    class _Ev:
+        session = SimpleNamespace(sid=SID)
+    class _Res:
+        ok = False
+        err = "禁言中或达到发言频率限制，消息发送失败"
+    ok1 = plug._note_send_failure(_Ev(), _Res())
+    ok2 = plug._is_muted(SID)
+    return {"MT2 发送失败识别禁言": ok1, "MT2 进入静默": ok2}
+
+async def dmw1_dm_watch_one_shot(mod):
+    """私聊空停守望：下一批只判一次；wait 时本批不送 LLM、消息留缓冲。"""
+    plug, buf, proc = make_plugin(mod, {"section_dm_sustain": {"dm_sustain_enabled": True}})
+    plug.jev_enabled = True
+    plug.jev_watch_enabled = True
+    plug.jev_dm_watch_enabled = True
+    fake = _FakeJevClient([
+        {"choice": "wait", "confidence": 0.9, "probabilities": {}, "model": "m"},
+        {"choice": "reply", "confidence": 0.9, "probabilities": {}, "model": "m"},
+    ])
+    plug._jev_client = fake
+    plug._arm_dm_watch(DMSID, "ai_empty")
+    ok0 = DMSID in plug._dm_watch
+
+    def _batch(eid, mid, text):
+        ev = SimpleNamespace(
+            event_id=eid, messages=[_msg(mid, text)], extra=None,
+            session=SimpleNamespace(sid=DMSID), is_stopped=False)
+        ev.is_group_message = lambda: False
+        ev.sid = DMSID
+        ev.stop = lambda: setattr(ev, "is_stopped", True)
+        return ev
+
+    ev = _batch("d1", "dm1", "在吗")
+    buf.buffer.append(SimpleNamespace(message=_msg("dm1", "在吗")))
+    await plug.on_queue_merge_batch(ev)
+    await asyncio.sleep(0.1)
+    ok1 = ev.is_stopped
+    ok2 = proc.flushed == []
+    ok3 = not plug._dm_watch
+    ok4 = len(buf.buffer) >= 1              # 消息还原，不丢
+
+    # 第二批（新的用户消息）不应再被私聊守望消耗
+    ev2 = _batch("d2", "dm2", "再问一次")
+    await plug.on_queue_merge_batch(ev2)
+    await asyncio.sleep(0.05)
+    ok5 = not ev2.is_stopped               # 没有守望 → 正常放行
+    return {"DMW1 私聊守望武装": ok0, "DMW1 首批 stop": ok1,
+            "DMW1 wait 不送 LLM": ok2, "DMW1 判完即解除": ok3,
+            "DMW1 消息还原不丢": ok4, "DMW1 下一批正常放行": ok5}
+
+async def dmw2_dm_watch_reply(mod):
+    """私聊守望 reply ⇒ 后台 flush 重新接话。"""
+    plug, buf, proc = make_plugin(mod, {"section_dm_sustain": {"dm_sustain_enabled": True}})
+    plug.jev_enabled = True
+    plug.jev_watch_enabled = True
+    plug.jev_dm_watch_enabled = True
+    plug._jev_client = _FakeJevClient([
+        {"choice": "reply", "confidence": 0.9, "probabilities": {}, "model": "m"}])
+    plug._arm_dm_watch(DMSID, "ai_empty")
+    ev = SimpleNamespace(
+        event_id="d3", messages=[_msg("dm3", "在吗")], extra=None,
+        session=SimpleNamespace(sid=DMSID), is_stopped=False)
+    ev.is_group_message = lambda: False
+    ev.sid = DMSID
+    ev.stop = lambda: setattr(ev, "is_stopped", True)
+    await plug.on_queue_merge_batch(ev)
+    await asyncio.sleep(0.1)
+    return {"DMW2 reply ⇒ flush": proc.flushed == [DMSID]}
+
 # ---------------------------------------------------------------- 汇总
 async def run(plugin_dir: Path):
     mod, jev = load_plugin(plugin_dir)
@@ -635,11 +969,14 @@ async def run(plugin_dir: Path):
     for fn in (p3_decide, p4_breaker, p5_fallback_chain):
         for label, cond in (await fn(jev)).items():
             check(label, cond)
+    for label, cond in (await p6_both_provider_groups(mod, jev)).items():
+        check(label, cond)
     for label, cond in m1_mode_table(mod).items():
         check(label, cond)
     for label, cond in m2_render(mod).items():
         check(label, cond)
-    for fn in (d1_confirm_veto, d2_confirm_ok, d3_abstain_fallback, d4_boost_hit, d5_boost_hold):
+    for fn in (d1_confirm_veto, d2_confirm_ok, d3_abstain_fallback, d4_boost_hit,
+               d5_boost_hold, d7_deferred_aborts_on_stop, d8_deferred_aborts_when_flushed):
         for label, cond in (await fn(mod)).items():
             check(label, cond)
     # 小模型判官 + 评分回补（S/Z 共有）
@@ -647,12 +984,17 @@ async def run(plugin_dir: Path):
         check(label, cond)
     for label, cond in (await l2_backend_dispatch(mod, jev)).items():
         check(label, cond)
+    for label, cond in (await l3_aux_error_and_criteria(jev)).items():
+        check(label, cond)
     for fn in (r1_refund_on_veto, r2_no_refund_on_confirm, r3_no_refund_on_abstain):
         for label, cond in (await fn(mod)).items():
             check(label, cond)
     # sustain / 守望仅 S 版有（z 版无持续对话与空停守望）
     if hasattr(mod.DebouncePlugin, "_watch_fire") or hasattr(mod.DebouncePlugin, "_arm_watch_after_empty_stop"):
-        for fn in (d6_sustain_window_closed, w1_watch_reply, w2_watch_wait, w3_watch_disarm_on_wake):
+        for fn in (d6_sustain_window_closed, w1_watch_reply, w2_watch_wait,
+                   w3_watch_disarm_on_wake, w4_watch_full_immediate, w5_watch_none_once,
+                   mt1_mute_notice, mt2_send_failure_fallback,
+                   dmw1_dm_watch_one_shot, dmw2_dm_watch_reply):
             for label, cond in (await fn(mod)).items():
                 check(label, cond)
         for label, cond in sc_scope_table(mod).items():

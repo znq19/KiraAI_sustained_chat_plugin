@@ -203,7 +203,8 @@ async def s3_watch_full_chain_reply(mod):
     return {"S3 守望武装": ok0, "S3 JEV 被调用": ok1,
             "S3 reply ⇒ flush 出新消息": ok2, "S3 解闩": ok3, "S3 解除守望": ok4}
 
-async def s4_watch_wait_cooldown(mod):
+async def s4_watch_wait_once(mod):
+    """wait ⇒ 维持停窗并结束本次守望；后续新消息不再触发 JEV。"""
     plug, buf, proc = make_plugin(mod, watch=True,
                                   jev_answer={"choice": "wait", "confidence": 0.95,
                                               "probabilities": {"wait": 0.95}, "model": "m"})
@@ -216,8 +217,8 @@ async def s4_watch_wait_cooldown(mod):
     ok1 = plug._jev_client.calls >= 1
     ok2 = proc.flushed == []
     ok3 = plug.sustain_stopped.get(SID, False) is True
-    ok4 = plug._watch_cooldown_until.get(SID, 0) > time.time()
-    # 冷却期内新消息只计数不判断
+    ok4 = not plug._watch_active(SID)
+    # 守望已解除：新消息只进缓冲，不再判
     m2 = _msg("n2", "又一条")
     buf.buffer.append(SimpleNamespace(message=m2))
     plug._watch_track(SID, SimpleNamespace(message=m2))
@@ -225,7 +226,7 @@ async def s4_watch_wait_cooldown(mod):
     ok5 = plug._jev_client.calls == 1
     await plug.terminate()
     return {"S4 JEV 被调用": ok1, "S4 wait ⇒ 不 flush": ok2, "S4 闩保持": ok3,
-            "S4 冷却登记": ok4, "S4 冷却期不再判断": ok5}
+            "S4 wait ⇒ 立即解除守望": ok4, "S4 后续批次不再判断": ok5}
 
 # ---------------------------------------------------------------- S5 confirm 延迟否决全链路
 async def s5_confirm_veto_chain(mod):
@@ -260,7 +261,7 @@ async def run(plugin_dir: Path):
         check(label, cond)
     for label, cond in (await s3_watch_full_chain_reply(mod)).items():
         check(label, cond)
-    for label, cond in (await s4_watch_wait_cooldown(mod)).items():
+    for label, cond in (await s4_watch_wait_once(mod)).items():
         check(label, cond)
     for label, cond in (await s5_confirm_veto_chain(mod)).items():
         check(label, cond)
