@@ -153,6 +153,9 @@ class DebouncePlugin(BasePlugin):
         )
         # 主动屏蔽工具开关（manage_ignore）：关闭后 bot 不再能主动屏蔽骚扰
         self.enable_manage_ignore = basic.get("enable_manage_ignore", True)
+        # 禁言静默感知（默认关，避免影响原有持续对话/主动逻辑）：
+        # 开启后才解析 QQ增强禁言 notice / 发送失败兜底，并暂停持续/守望/私聊主动。
+        self.mute_guard_enabled = bool(basic.get("mute_guard_enabled", False))
 
         # ========== 从 section_media 读取媒体处理配置 ==========
         media = cfg.get("section_media", {})
@@ -445,6 +448,8 @@ class DebouncePlugin(BasePlugin):
         logger.info("[Debounce] 插件已初始化")
         logger.info(f"[Debounce] 唤醒词: {self.waking_words}")
         logger.info(f"[Debounce] 接收非唤醒消息: {self.receive_unmentioned}")
+        if self.mute_guard_enabled:
+            logger.info("[Debounce] 禁言静默感知已启用（QQ增强 notice + 发送失败兜底）")
         if self.sustain_enabled:
             logger.info(f"[Debounce] 群聊持续对话已启用: mode={self.sustain_mode}, window={self.sustain_window_seconds}s, prob={self.sustain_reply_probability}, max={self.max_sustain_replies}")
         if self.dm_sustain_enabled:
@@ -544,6 +549,18 @@ class DebouncePlugin(BasePlugin):
                         )
                     except Exception as e:
                         logger.warning(f"[Debounce] 自动停用默认聊天插件失败，请手动停用以避免双重防抖: {e}")
+
+                # ---- Z 版（default-chat（z））：与 S 版功能重叠，S 优先，直接停用 ----
+                _z_pid = _loaded.get("default-chat（z）")
+                if _z_pid and _z_pid != _SELF_PLUGIN_ID:
+                    try:
+                        await _pm.set_plugin_enabled(_z_pid, False)
+                        logger.warning(
+                            "[Debounce] 检测到 Z 版「default-chat（z）」已加载，"
+                            "S 版为完整版（含持续对话/空停守望），已自动停用 Z 以避免双重防抖/重复处理"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[Debounce] 自动停用 Z 版插件失败，请手动停用以避免双重防抖: {e}")
 
                 # ---- anti-harass：直接停用 ----
                 for _pid_lower, _pid in list(_loaded.items()):
@@ -1134,7 +1151,9 @@ class DebouncePlugin(BasePlugin):
     # ---------- 禁言静默（QQ增强通知 + 发送失败兜底） ----------
 
     def _is_muted(self, sid: str, now: float | None = None) -> bool:
-        """该会话是否处于禁言静默期（到期自动清理）。"""
+        """该会话是否处于禁言静默期（到期自动清理）。开关关闭时恒 False。"""
+        if not getattr(self, "mute_guard_enabled", False):
+            return False
         until = self._muted_until.get(sid, 0.0)
         if until <= 0.0:
             return False
@@ -1152,6 +1171,8 @@ class DebouncePlugin(BasePlugin):
         变成反复尝试。这里只静默，不落 `sustain_stopped` 闩——禁言不是
         对话意义上的“停止”，解除后应恢复正常。
         """
+        if not getattr(self, "mute_guard_enabled", False):
+            return
         try:
             until = time.time() + max(1.0, float(seconds))
             self._muted_until[sid] = max(self._muted_until.get(sid, 0.0), until)
@@ -1173,6 +1194,8 @@ class DebouncePlugin(BasePlugin):
 
     def _note_mute_notice(self, event) -> None:
         """从 QQ增强注入的 notice 文本里解析禁言/解除禁言。"""
+        if not getattr(self, "mute_guard_enabled", False):
+            return
         try:
             if not getattr(event, "is_notice", False):
                 return
@@ -1203,6 +1226,8 @@ class DebouncePlugin(BasePlugin):
 
         返回 True 表示已判定为禁言（调用方不再计 bot_speech）。
         """
+        if not getattr(self, "mute_guard_enabled", False):
+            return False
         try:
             if result is None or getattr(result, "ok", True):
                 return False
@@ -3556,7 +3581,8 @@ class DebouncePlugin(BasePlugin):
         `result.ok=False` 且错误文本命中禁言/频率限制时，进入静默（兜底“没收到
         QQ增强禁言通知”的情况）；失败的发送不计 bot_speech。
         """
-        if result is not None and not bool(getattr(result, "ok", True)):
+        if self.mute_guard_enabled and result is not None \
+                and not bool(getattr(result, "ok", True)):
             # 失败/空消息发送不是"bot 说了话"：禁言兜底之外也不要计 bot_speech
             self._note_send_failure(event, result)
             return

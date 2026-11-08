@@ -862,7 +862,9 @@ def sc_scope_table(mod):
 # ---------------------------------------------------------------- MT 系：禁言 / 私聊守望
 async def mt1_mute_notice(mod):
     """QQ增强禁言 notice ⇒ 静默；禁言期间不武装守望；解除 notice 恢复。"""
-    plug, buf, proc = make_plugin(mod, {"section_group_sustain": {"sustain_enabled": True}})
+    plug, buf, proc = make_plugin(mod, {
+        "section_basic": {"mute_guard_enabled": True},
+        "section_group_sustain": {"sustain_enabled": True}})
     plug.jev_enabled = True
     plug.jev_watch_enabled = True
 
@@ -871,6 +873,11 @@ async def mt1_mute_notice(mod):
         def is_group_message(self): return True
         session = SimpleNamespace(sid=SID)
         message = SimpleNamespace(chain=[_text_elem("[System 用户x 禁言了你120秒]")])
+
+    # 默认关：完全旧行为（不解析 notice、不静默）
+    plug0, _, _ = make_plugin(mod)
+    plug0._note_mute_notice(_Ev())
+    ok0 = not plug0._is_muted(SID)
 
     plug._note_mute_notice(_Ev())
     ok1 = plug._is_muted(SID)
@@ -881,12 +888,13 @@ async def mt1_mute_notice(mod):
     _Ev.message.chain = [_text_elem("[System 你之前被禁言了，用户x解除了你的禁言]")]
     plug._note_mute_notice(_Ev())
     ok3 = not plug._is_muted(SID)
-    return {"MT1 禁言 notice 生效": ok1, "MT1 禁言期间不武装守望": ok2,
+    return {"MT1 默认关不解析 notice": ok0,
+            "MT1 禁言 notice 生效": ok1, "MT1 禁言期间不武装守望": ok2,
             "MT1 解除 notice 恢复": ok3}
 
 async def mt2_send_failure_fallback(mod):
     """没收到禁言通知时，发送失败 err 兜底进入静默。"""
-    plug, _, _ = make_plugin(mod)
+    plug, _, _ = make_plugin(mod, {"section_basic": {"mute_guard_enabled": True}})
     plug._clear_muted(SID)
     class _Ev:
         session = SimpleNamespace(sid=SID)
