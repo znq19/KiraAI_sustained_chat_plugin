@@ -3440,16 +3440,16 @@ class DebouncePlugin(BasePlugin):
             try:
                 # 先把 chat_env 模板渲染成最终文本，再按纯文本追加：
                 # 既保留原来的“同一块 chat_env / 原顺序”，又不让用户提示词里的
-                # `{}` 进入 Jinja 模板。p.end 置空避免 to_string() 再加一次换行。
+                # `{}` 进入 Jinja 模板。剥掉 to_string() 自动加的 end，保留 p.end，
+                # 最终仍是「渲染文本 + 群聊提示词 + 原换行」，与旧输出逐字一致。
                 rendered = (
                     p.to_string() if getattr(p, "render_template", False)
                     else (p.content or "")
                 )
+                _end = getattr(p, "end", "\n") or ""
+                if _end and rendered.endswith(_end):
+                    rendered = rendered[:-len(_end)]
                 p.content = rendered + self.group_chat_prompt
-                try:
-                    p.end = ""
-                except Exception:
-                    pass
                 p.render_template = False
             except Exception:
                 try:
