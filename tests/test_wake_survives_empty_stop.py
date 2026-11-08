@@ -23,6 +23,7 @@
   T5 停窗拦截遇纯持续命中批 ⇒ 还原前文 + stop（旧行为保持）
   T6 判定异常（get_buffer 抛）⇒ 保守保留（不误杀）
   T7 _end_sustain_window 同款守卫：真唤醒在途时批次不被超时清理连坐
+  T8 停窗拦截遇纯非唤醒批（主动概率）⇒ **不拦截**（主动发言是独立通路/别的唤醒）
 
 Run: python3 tests/test_wake_survives_empty_stop.py [<plugin_dir> ...]
 """
@@ -248,11 +249,26 @@ async def t7_window_timeout_guard(mod):
         "T7 _pending_batch_has_real_wake 判真": plug._pending_batch_has_real_wake(SID),
     }
 
+async def t8_pure_nonwake_batch_not_blocked(mod):
+    """停窗后的无 mentioned 批次（主动概率）不拦截：主动发言是独立通路，
+    也是用户口中的“别的唤醒”，不能被持续停窗误杀。"""
+    plug, buf, proc = make_plugin(mod)
+    plug.sustain_stopped[SID] = True
+    p = _msg("p1", False, "主动概率命中")
+    ev = _batch_event(mod, plug, [p], eid="b3")
+    await plug.on_queue_merge_batch(ev)
+    return {
+        "T8 纯非唤醒批不被 stop": not ev.is_stopped,
+        "T8 消息不被还原（继续走主动通路）": buf.buffer == [],
+        "T8 闩保持（只影响持续命中批）": plug.sustain_stopped.get(SID, False) is True,
+    }
+
 async def run(plugin_dir: Path):
     mod = load_main(plugin_dir)
     for fn in (t1_real_wake_survives, t2_pure_hit_still_dropped, t3_no_wake_still_dropped,
                t4_unlatch_on_real_wake_batch, t5_pure_hit_batch_restored,
-               t6_error_conservative, t7_window_timeout_guard):
+               t6_error_conservative, t7_window_timeout_guard,
+               t8_pure_nonwake_batch_not_blocked):
         out = await fn(mod)
         for label, cond in out.items():
             check(label, cond)
