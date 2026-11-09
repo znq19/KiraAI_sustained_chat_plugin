@@ -3515,16 +3515,19 @@ class DebouncePlugin(BasePlugin):
 
     @register.tool(
         name="read_forward",
-        description="按需展开合并聊天记录。depth=1看当前层，N=向下N层，-1=拉取允许范围内全部剩余层；分页时传返回的 cursor。",
+        description="按需展开一个或多个合并聊天记录，内部并行处理。depth=1看当前层，N=向下N层，-1=拉取允许范围内全部剩余层；分页时传返回的 cursor。",
         params={"type": "object", "properties": {
-            "forward_id": {"type": "string", "description": "Forward #id 中的 id"},
+            "forward_id": {"type": "string", "description": "单记录兼容参数：Forward #id 中的 id"},
+            "forward_ids": {"type": "array", "items": {"type": "string"},
+                            "description": "可选：多个 Forward ID，一次并行读取"},
             "depth": {"type": "integer", "default": 1},
-            "cursor": {"type": "string", "description": "分页游标，可选"},
-        }, "required": ["forward_id"]},
+            "cursor": {"type": "string", "description": "分页游标或多记录游标JSON，可选"},
+        }, "required": []},
     )
-    async def read_forward(self, event: KiraMessageBatchEvent, forward_id: str,
-                           depth: int = 1, cursor=None, **_):
-        return await self.media_recognizer.access.read_forward(event, forward_id, depth, cursor)
+    async def read_forward(self, event: KiraMessageBatchEvent, forward_id=None,
+                           depth: int = 1, cursor=None, forward_ids=None, **_):
+        return await self.media_recognizer.access.read_forward(
+            event, forward_id=forward_id, forward_ids=forward_ids, depth=depth, cursor=cursor)
 
     @on.llm_request(priority=Priority.HIGH)
     async def filter_access_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):

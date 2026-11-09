@@ -387,8 +387,9 @@ croniter>=1.3.0
 - **配置热更新**：`-1` 自动基准、fixed 0 模式、通知合并及 `max_buffer_messages` 均按需读取当前 WebUI 值；主 buffer、守望和 QueueMerge 的两个 `-1` 自动条数上限同步更新。调小条数不会裁剪已有消息；在飞计时调大可在原截止点继续等待，调小在下一条消息立即重算（无核心 configChanged 时最迟旧截止点）。
 - **缓存与兼容**：不修改 Prompt、消息顺序、模型组或媒体管线；同一输入批次的请求内容保持不变。保留纯前文保险丝、条数满即推、停窗/JEV 和 QueueMerge 既有语义。
 - **媒体按需读取**：可选图片/表情与语音工具化；统一 `read_media` 批量接续缓存、预取和当前/历史媒体。VLM 返回真实描述，native 返回 media_refs 真图。私聊/群聊独立自动呈现开关，默认每类 1 个；图片与语音分别计数，@/引用/关键词唤醒直接呈现。
-- **Forward 分层读取**：可选保留原树，首轮逐节点显示发送者和 Image/Sticker/Record/Forward 占位；`read_forward` 支持逐层、最多4层、depth=-1 整子树和 cursor 分页。目录持久化但不重复保存媒体字节。
+- **Forward 分层读取**：默认开启并保留原树，首轮逐节点显示发送者和 Image/Sticker/Record/Forward 占位；`read_forward` 支持逐层、最多4层、depth=-1 整子树和 cursor 分页。目录持久化但不重复保存媒体字节。
 - **read_file 正常化**：删除 known-media 空占位拦截与 `guard_read_file_wait`；缓存命中返回真实描述，未命中正常读取/识别。
+- **批量并行与路径完整**：`read_forward` 支持多 ID 和记录内媒体并行，多记录独立 cursor；`media_tool_prefetch_enabled` 默认开，关闭后受控 VLM/STT 纯工具触发。占位、预览和工具结果继续携带可用 `file_path`。
 - 版本 2.7.6 → 2.8.0
 
 ### v2.7.6

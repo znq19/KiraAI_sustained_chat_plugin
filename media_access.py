@@ -53,7 +53,8 @@ class MediaAccessManager:
             basic = {}
         self.image_tool_enabled = bool(basic.get("media_tool_image_enabled", False))
         self.audio_tool_enabled = bool(basic.get("media_tool_audio_enabled", False))
-        self.forward_tool_enabled = bool(basic.get("forward_tool_enabled", False))
+        self.forward_tool_enabled = bool(basic.get("forward_tool_enabled", True))
+        self.prefetch_enabled = bool(basic.get("media_tool_prefetch_enabled", True))
         self.auto_private = bool(basic.get("media_tool_auto_present_private_enabled", True))
         self.auto_group = bool(basic.get("media_tool_auto_present_group_enabled", True))
         try:
@@ -86,6 +87,10 @@ class MediaAccessManager:
 
     def _enabled_for(self, kind: str) -> bool:
         return self.image_tool_enabled if self._is_visual(kind) else self.audio_tool_enabled
+
+    def allows_prefetch(self, kind: str) -> bool:
+        """Non-tool media keep the old behavior; tool media honor pure-on-demand mode."""
+        return True if not self._enabled_for(kind) else self.prefetch_enabled
 
     def _register_media(self, elem, kind: str, sid: str, message,
                         occurrence: int, nested: bool) -> str:
@@ -212,7 +217,9 @@ class MediaAccessManager:
             if isinstance(elem, Forward):
                 forward_id = self._forward_id_for_element(elem)
                 if forward_id:
-                    chain[index] = Text(self.render_forward(forward_id, depth=1, root_summary=True))
+                    preview = Text(self.render_forward(forward_id, depth=1, root_summary=True))
+                    preview._media_forward_id = forward_id
+                    chain[index] = preview
             elif isinstance(elem, Reply) and elem.chain is not None:
                 self._replace_forward_elements(elem.chain)
 
@@ -341,13 +348,53 @@ class MediaAccessManager:
         visiting.discard(record["id"])
         return total
 
+    def _known_path(self, entry: dict) -> str:
+        """Return an already-known local path without any I/O or download."""
+        elem = entry.get("elem")
+        path = entry.get("cache_path") or getattr(elem, "_temp_path", None)
+        if not path and getattr(elem, "file_type", "") == "path":
+            path = getattr(elem, "file", None)
+        if not path:
+            return ""
+        raw = str(path).replace("\\", "/")
+        if raw.startswith("data/"):
+            return raw
+        try:
+            p = Path(raw)
+            data_dir = get_data_path()
+            if p.is_absolute():
+                try:
+                    return "data/" + p.relative_to(data_dir).as_posix()
+                except ValueError:
+                    return p.as_posix()
+        except Exception:
+            pass
+        return raw
+
+    async def _actual_media_path(self, entry: dict) -> str:
+        known = self._known_path(entry)
+        if known:
+            return known
+        elem = entry.get("elem")
+        if elem is None:
+            return ""
+        try:
+            return await self.recognizer._media_path(elem) or ""
+        except Exception:
+            return ""
+
     @staticmethod
-    def _media_placeholder(elem: dict) -> str:
+    def _path_suffix(path: str) -> str:
+        return f", file_path: {path}" if path else ""
+
+    def _media_placeholder(self, elem: dict) -> str:
         kind = elem.get("kind")
         media_id = elem.get("media_id")
         label = kind if kind in ("Image", "Sticker", "Record") else "Media"
-        # 保留 S/Z 默认提示词识别的元素类型名，只追加稳定短 ID。
-        return f"[{label} #{media_id}: 可读取]"
+        entry = self._entries.get(media_id, {})
+        path = self._known_path(entry)
+        # 保留 S/Z 默认提示词识别的元素类型名，并继续携带已有本地路径。
+        return f"[{label} #{media_id}: 可读取{self._path_suffix(path)}]"
 
     def _chain_preview(self, chain: list, depth: int, indent: str, visiting: set,
                        preview: bool = False) -> tuple[list[str], list[str]]:
@@ -478,6 +525,7 @@ class MediaAccessManager:
         candidates = {"visual": [], "record": []}
         is_group = bool(event.is_group_message())
         auto_enabled = self.auto_group if is_group else self.auto_private
+        native_mode = bool(self.recognizer._native_mode(event.sid))
         for message in getattr(event, "messages", []) or []:
             for media_id in self._message_entries.get(id(message), []):
                 entry = self._entries.get(media_id)
@@ -487,6 +535,10 @@ class MediaAccessManager:
                 if elem is None:
                     continue
                 if not auto_enabled or getattr(elem, "_media_skip", False):
+                    lazy.add(media_id)
+                elif (not self.prefetch_enabled
+                      and not (native_mode and self._is_visual(entry["kind"]))):
+                    # 纯按需：VLM/STT 只能由工具触发；native 直图不调用 VLM，仍按自动规则。
                     lazy.add(media_id)
                 elif getattr(message, "is_mentioned", False):
                     direct.add(media_id)
@@ -506,7 +558,20 @@ class MediaAccessManager:
                     elem.caption = ""
         return direct, lazy
 
+    def refresh_forward_summaries(self, message) -> None:
+        """Refresh known paths after background persistence; no I/O or downloads."""
+        for elem in getattr(message, "chain", []):
+            forward_id = getattr(elem, "_media_forward_id", None)
+            if forward_id:
+                old = elem.text
+                new = self.render_forward(forward_id, depth=1, root_summary=True)
+                elem.text = new
+                current = getattr(message, "message_str", None)
+                if current and old in current:
+                    message.message_str = current.replace(old, new, 1)
+
     async def render_lazy_message(self, message) -> None:
+        self.refresh_forward_summaries(message)
         text = getattr(message, "message_str", None)
         if not text:
             return
@@ -521,10 +586,11 @@ class MediaAccessManager:
             if kind == "Record":
                 old_id = getattr(elem, "_pir_short_id", "")
                 if old_id:
-                    text = text.replace(f"[Record #{old_id}: ]", f"[Record #{media_id}: 可读取]")
+                    placeholder = f"[Record #{media_id}: 可读取{self._path_suffix(self._known_path(entry))}]"
+                    text = text.replace(f"[Record #{old_id}: ]", placeholder)
                 continue
             label = "Image" if kind == "Image" else "Sticker"
-            placeholder = f"[{label} #{media_id}: 可读取]"
+            placeholder = f"[{label} #{media_id}: 可读取{self._path_suffix(self._known_path(entry))}]"
             patterns = [rf"\[{label} attached\]", rf"\[{label}\s*, file_path: [^\]]+\]",
                         rf"\[{label}\s*\]"]
             for pattern in patterns:
@@ -601,64 +667,129 @@ class MediaAccessManager:
             try:
                 if self._is_visual(kind) and self.recognizer._native_mode(event.sid):
                     ref = await self._store_media(elem, event.sid, entry["message_id"])
-                    return media_id, ref, "已返回原生图片"
+                    path = (ref or {}).get("path") or await self._actual_media_path(entry)
+                    text = f"[{kind} #{media_id}: 已返回原生图片{self._path_suffix(path)}]"
+                    return media_id, ref, text
                 desc = await self.recognizer.read_access_entry(entry, event)
                 if not desc:
                     return media_id, None, "识别失败或结果为空"
-                return media_id, None, desc
+                path = await self._actual_media_path(entry)
+                text = f"[{kind} #{media_id}: {desc}{self._path_suffix(path)}]"
+                return media_id, None, text
             except Exception as exc:
                 return media_id, None, f"读取失败：{type(exc).__name__}: {exc}"
 
         results = await asyncio.gather(*(one(mid) for mid in ids))
         lines, refs = [], []
         for media_id, ref, text in results:
-            lines.append(f"[{media_id}] {text}")
+            lines.append(text)
             if ref is not None:
                 refs.append(ref)
         return ToolResult(text="\n".join(lines), media_refs=refs)
 
-    async def read_forward(self, event, forward_id: str, depth=1, cursor=None) -> ToolResult:
-        if not self.forward_tool_enabled:
-            return ToolResult(text="合并记录按需读取未开启")
+    async def _read_forward_one(self, event, forward_id: str, depth=1, cursor=None):
         record = await self._forward(forward_id)
         if record is None:
-            return ToolResult(text="合并记录不存在或目录已过期")
-        # Persisted trees have no runtime children index; load referenced nodes lazily.
-        async def load_tree(rec):
-            for chain in rec.get("children", []):
+            return f"Forward {forward_id} 不存在或目录已过期", [], None
+
+        async def load_tree(rec, visiting):
+            if rec["id"] in visiting:
+                return
+            visiting.add(rec["id"])
+            async def walk_chain(chain):
                 for elem in chain:
                     if elem.get("type") == "forward":
                         child = await self._forward(elem["forward_id"])
                         if child is not None:
-                            await load_tree(child)
+                            await load_tree(child, visiting)
+                    elif elem.get("type") == "media":
+                        await self._entry(elem["media_id"])
                     elif elem.get("type") == "reply" and elem.get("chain"):
-                        for item in elem["chain"]:
-                            if item.get("type") == "forward":
-                                child = await self._forward(item["forward_id"])
-                                if child is not None:
-                                    await load_tree(child)
-        await load_tree(record)
+                        await walk_chain(elem["chain"])
+            for chain in rec.get("children", []):
+                await walk_chain(chain)
+
+        await load_tree(record, set())
         text = self.render_forward(forward_id, depth=depth, cursor=cursor)
-        refs = []
-        # If media tools are off, expansion itself presents media in the current mode.
         ids = list(dict.fromkeys(re.findall(r"#([isr][0-9a-f]{12}): 可读取", text)))
-        for media_id in ids:
+
+        async def present(media_id):
             entry = await self._entry(media_id)
             if entry is None or self._enabled_for(entry["kind"]):
-                continue
+                return media_id, None, None, ""
             elem = await self._resolve_media_element(entry)
             if elem is None:
-                continue
+                return media_id, None, "媒体源不可用", ""
             try:
                 if self._is_visual(entry["kind"]) and self.recognizer._native_mode(event.sid):
-                    refs.append(await self._store_media(elem, event.sid, entry["message_id"]))
+                    ref = await self._store_media(elem, event.sid, entry["message_id"])
+                    path = (ref or {}).get("path") or await self._actual_media_path(entry)
+                    return media_id, ref, "已返回原生图片", path
+                desc = await self.recognizer.read_access_entry(entry, event)
+                return media_id, None, desc or "读取失败", await self._actual_media_path(entry)
+            except Exception as exc:
+                return media_id, None, f"读取失败：{type(exc).__name__}", ""
+
+        # 单个 Forward 内的媒体也并行；多个 Forward 由外层 gather 再并行一层。
+        presented = await asyncio.gather(*(present(mid) for mid in ids))
+        refs = []
+        for media_id, ref, desc, path in presented:
+            if ref is not None:
+                refs.append(ref)
+            if desc:
+                has_path = f"#{media_id}: 可读取, file_path:" in text
+                suffix = "" if has_path else self._path_suffix(path)
+                text = text.replace(f"#{media_id}: 可读取", f"#{media_id}: {desc}{suffix}")
+        match = re.search(r"下一页 cursor=(\d+)", text)
+        return text, refs, match.group(1) if match else None
+
+    async def read_forward(self, event, forward_id=None, depth=1, cursor=None,
+                           forward_ids=None) -> ToolResult:
+        if not self.forward_tool_enabled:
+            return ToolResult(text="合并记录按需读取未开启")
+        ids = []
+        if isinstance(forward_ids, str):
+            try:
+                decoded = json.loads(forward_ids)
+                if isinstance(decoded, list):
+                    ids.extend(decoded)
                 else:
-                    desc = await self.recognizer.read_access_entry(entry, event)
-                    if desc:
-                        text = text.replace(f"#{media_id}: 可读取", f"#{media_id}: {desc}")
-            except Exception:
-                text = text.replace(f"#{media_id}: 可读取", f"#{media_id}: 读取失败")
-        return ToolResult(text=text, media_refs=refs)
+                    ids.extend(x.strip() for x in forward_ids.split(",") if x.strip())
+            except ValueError:
+                ids.extend(x.strip() for x in forward_ids.split(",") if x.strip())
+        elif isinstance(forward_ids, (list, tuple)):
+            ids.extend(forward_ids)
+        if forward_id:
+            ids.insert(0, forward_id)
+        ids = list(dict.fromkeys(str(x).strip() for x in ids if str(x).strip()))
+        if not ids:
+            return ToolResult(text="请提供至少一个 Forward ID")
+
+        def cursor_for(fid):
+            current = cursor
+            if isinstance(current, str) and current.strip().startswith("{"):
+                try:
+                    current = json.loads(current)
+                except ValueError:
+                    return None
+            if isinstance(current, dict):
+                return current.get(fid)
+            return current if len(ids) == 1 else None
+
+        results = await asyncio.gather(*(
+            self._read_forward_one(event, fid, depth, cursor_for(fid)) for fid in ids))
+        texts, refs, next_cursors = [], [], {}
+        for fid, (text, media_refs, next_cursor) in zip(ids, results):
+            texts.append(text)
+            refs.extend(media_refs)
+            if next_cursor is not None:
+                next_cursors[fid] = next_cursor
+        unique_refs = {}
+        for ref in refs:
+            unique_refs[(ref.get("type"), ref.get("path"))] = ref
+        if len(ids) > 1 and next_cursors:
+            texts.append("[多记录分页游标：" + json.dumps(next_cursors) + "]")
+        return ToolResult(text="\n\n".join(texts), media_refs=list(unique_refs.values()))
 
     async def shutdown(self) -> None:
         tasks = list(self._bg_tasks)

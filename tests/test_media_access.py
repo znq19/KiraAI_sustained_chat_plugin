@@ -14,13 +14,23 @@ class Recognizer:
     def __init__(self):
         self.native = False
         self.calls = []
+        self.delay = 0
+        self.active = 0
+        self.max_active = 0
 
     def _native_mode(self, sid=None):
         return self.native
 
     async def read_access_entry(self, entry, event):
-        self.calls.append(entry["id"])
-        return f"{entry['kind']}识别结果"
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            self.calls.append(entry["id"])
+            return f"{entry['kind']}识别结果"
+        finally:
+            self.active -= 1
 
     async def _persist_media(self, elem):
         return getattr(self, "persist_path", None), "md5"
@@ -103,6 +113,7 @@ async def run(plugin_dir: Path):
 
     nested_id = nested._media_access_forward_id
     deep_id = deepest._media_access_forward_id
+    other_id = other._media_access_forward_id
     expanded = manager.render_forward(nested_id, depth=2)
     check("嵌套块也显示直接子节点预览", "在吗" in expanded and "晚安" in expanded
           and deep_id in expanded)
@@ -110,6 +121,8 @@ async def run(plugin_dir: Path):
 
     all_text = manager.render_forward(root_id, depth=-1)
     check("depth=-1展开允许范围内整棵树", "明天见" in all_text and "晚安" in all_text)
+    multi = await manager.read_forward(event([]), forward_ids=[root_id, other_id], depth=-1)
+    check("多个Forward ID一次并行读取", "我爱你" in multi.text and "明天见" in multi.text)
     check("最大深度默认4", manager.forward_max_depth == 4)
 
     overdeep = Forward([chain("[2026-01-01 00:00:00] 周武: L1")])
@@ -142,10 +155,19 @@ async def run(plugin_dir: Path):
     cursor = full_page.rsplit("cursor=", 1)[1].rstrip("]")
     rest = manager.render_forward(long_id, depth=1, cursor=cursor)
     check("下一页cursor可用", rest and "cursor=" not in rest)
+    multi_page = await manager.read_forward(
+        event([]), forward_ids=[long_id, other_id], depth=1)
+    check("多记录分页返回各自cursor", "多记录分页游标" in multi_page.text)
+    cursor_json = multi_page.text.rsplit("多记录分页游标：", 1)[1].rstrip("]")
+    multi_rest = await manager.read_forward(
+        event([]), forward_ids=[long_id, other_id], depth=1, cursor=cursor_json)
+    check("多记录游标可继续读取", "长" in multi_rest.text)
 
     # Persistence: a fresh manager must load the same tree lazily.
     if manager._bg_tasks:
         await asyncio.gather(*manager._bg_tasks, return_exceptions=True)
+    path_summary = manager.render_forward(root_id, root_summary=True)
+    check("Forward预览保留已知file_path", "file_path:" in path_summary)
     restored = module.MediaAccessManager(None, rec, media_config(), "test-media-access")
     restored._entry_dir = manager._entry_dir
     restored._forward_dir = manager._forward_dir
@@ -156,6 +178,8 @@ async def run(plugin_dir: Path):
         for elem in ch if elem.get("type") == "media")
     restored_media = await restored.read_media(event([]), [deep_media_id])
     check("重启后嵌套媒体仍可读取", "Image识别结果" in restored_media.text,
+          restored_media.text)
+    check("历史工具结果保留file_path", "file_path:" in restored_media.text,
           restored_media.text)
     await restored.shutdown()
 
@@ -185,6 +209,38 @@ async def run(plugin_dir: Path):
     direct, lazy = private_off.apply_batch_policy(event([single], group=False))
     check("私聊开关可独立关闭自动呈现", not direct and len(lazy) == 1)
 
+    # Pure on-demand mode: no VLM/STT bypass, while native needs no VLM.
+    pure_rec = Recognizer()
+    pure = module.MediaAccessManager(None, pure_rec, media_config(
+        media_tool_prefetch_enabled=False), "test-pure")
+    pure_image = message("pure", MessageChain([Image("base64://aW1n")]), mentioned=True)
+    pure.prepare_message(pure_image, SID)
+    direct, lazy = pure.apply_batch_policy(event([pure_image]))
+    check("关闭积极模式后VLM只能由工具触发", not direct and len(lazy) == 1)
+    check("纯按需禁止工具媒体预取", not pure.allows_prefetch("Image")
+          and not pure.allows_prefetch("Record"))
+    non_tool = module.MediaAccessManager(None, pure_rec, media_config(
+        media_tool_image_enabled=False, media_tool_audio_enabled=False,
+        media_tool_prefetch_enabled=False), "test-old-prefetch")
+    check("非工具媒体不受新开关影响", non_tool.allows_prefetch("Image")
+          and non_tool.allows_prefetch("Record"))
+    pure_rec.native = True
+    direct, lazy = pure.apply_batch_policy(event([pure_image]))
+    check("纯按需不阻止native直图自动呈现", len(direct) == 1 and not lazy)
+    await pure.shutdown()
+    await non_tool.shutdown()
+
+    parallel_rec = Recognizer()
+    parallel_rec.delay = 0.03
+    parallel = module.MediaAccessManager(None, parallel_rec, media_config(
+        media_tool_image_enabled=False, media_tool_audio_enabled=False), "test-parallel")
+    parallel.prepare_message(message("root", MessageChain([root])), SID)
+    parallel_result = await parallel.read_forward(event([]), root_id, depth=-1)
+    check("Forward内部媒体真实并行", parallel_rec.max_active >= 2,
+          parallel_rec.max_active)
+    check("并行展开仍返回真实描述", "Image识别结果" in parallel_result.text)
+    await parallel.shutdown()
+
     # Unified media tool returns real results and native refs without duplicate calls.
     calls_before = len(rec.calls)
     read_result = await manager.read_media(event([mixed]), list(manager._message_entries[id(mixed)]))
@@ -198,6 +254,8 @@ async def run(plugin_dir: Path):
     module.store_session_media = fake_store
     native_result = await manager.read_media(event([mixed]), [manager._message_entries[id(mixed)][0]])
     check("原生工具返回media_refs真图", len(native_result.media_refs) == 1)
+    check("原生工具文本也保留file_path", "file_path: session_media/x" in native_result.text,
+          native_result.text)
 
     await manager.shutdown()
     await private_off.shutdown()

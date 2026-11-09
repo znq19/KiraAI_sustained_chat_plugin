@@ -191,6 +191,12 @@
         "default": false,
         "hint": "开启后语音使用 Record 短ID占位，由统一 read_media 读取；关闭则保持当前并行STT"
       },
+      "media_tool_prefetch_enabled": {
+        "type": "switch",
+        "name": "积极预取媒体",
+        "default": true,
+        "hint": "开启后符合规则的媒体在后台并行预取；关闭后受控媒体仅由 read_media/read_forward 触发VLM/STT，原生直图仍由自动呈现开关控制"
+      },
       "media_tool_auto_present_private_enabled": {
         "type": "switch",
         "name": "私聊小批次直接呈现",
@@ -213,7 +219,7 @@
       "forward_tool_enabled": {
         "type": "switch",
         "name": "合并记录分层按需读取",
-        "default": false,
+        "default": true,
         "hint": "开启后保留 Forward 原树，首轮显示逐节点外层摘要，可用 read_forward 下钻；关闭则保持原仅唤醒解析规则"
       },
       "forward_max_depth": {

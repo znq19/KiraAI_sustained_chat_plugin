@@ -9,11 +9,12 @@ from core.chat.message_elements import Image
 from test_queue_timing import batch
 
 
-def plugin_config(tool=True, max_count=1):
+def plugin_config(tool=True, max_count=1, prefetch=True):
     cfg = config(0.2)
     cfg["section_media"] = {
         "media_tool_image_enabled": tool,
         "media_tool_audio_enabled": False,
+        "media_tool_prefetch_enabled": prefetch,
         "media_tool_auto_present_private_enabled": True,
         "media_tool_auto_present_group_enabled": True,
         "media_tool_auto_present_max_count": max_count,
@@ -86,6 +87,20 @@ async def run(plugin_dir: Path):
     message, batch_event = await prepare(mod, context, plug, "wake-double", 2)
     check("唤醒双图仍直接并行呈现", (message.message_str or "").count("一只猫") == 2,
           message.message_str)
+    await shutdown(plug)
+
+    context = Ctx({"bot_config.capabilities.image_recognition.mode": "vlm_description"})
+    plug = mod.DebouncePlugin(context, plugin_config(prefetch=False))
+    async def fake_describe(*args, **kwargs):
+        return "一只猫"
+    plug.media_recognizer._describe_image = fake_describe
+    message, batch_event = await prepare(mod, context, plug, "pure", 1)
+    check("纯按需唤醒单图也不绕过工具识别", "可读取" in (message.message_str or "")
+          and "一只猫" not in message.message_str, message.message_str)
+    ids = list(plug.media_recognizer.access._message_entries[id(message)])
+    result = await plug.media_recognizer.access.read_media(batch_event, ids)
+    check("纯按需调用工具后返回真实描述与路径", "一只猫" in result.text
+          and "file_path:" in result.text, result.text)
     await shutdown(plug)
     return all(results)
 

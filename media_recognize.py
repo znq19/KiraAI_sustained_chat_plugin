@@ -1137,7 +1137,11 @@ class ParallelMediaRecognizer:
                 # 被显式判定不识别的媒体（仅唤醒识别的非唤醒媒体 / 概率未中 / 超上限）
                 # 不在这里 —— 那是配置要求的省 VLM，预取它等于绕过用户的开关。
                 for k, v in (getattr(m, "_pir_media", None) or {}).items():
-                    if isinstance(v, dict) and not v.get("_done") and k not in media:
+                    if not isinstance(v, dict) or v.get("_done"):
+                        continue
+                    if not self.access.allows_prefetch(str(v.get("type", ""))):
+                        continue
+                    if k not in media:
                         media[k] = v
             if not media:
                 return
