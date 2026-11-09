@@ -137,11 +137,11 @@ async def g2_g5(mr):
         out["G2 表情包直调原始函数"] = (len(orig_calls) == n_before + 1)
         out["G2 表情包零守卫分支"] = (rec.calls == {"index": 0, "known": 0, "await": 0})
 
-        # G3 聊天图片调用：走守卫（先查索引，再查已知，最后原函数）
+        # G3 聊天图片/read_file：共享缓存索引可用，但不再检查known或拦截原函数。
         rec.calls = {"index": 0, "known": 0, "await": 0}
         r2 = await wrapped(client="vlm", image=_img(CHAT_PATH), prompt="chat")
         out["G3 聊天图走守卫（索引被查）"] = rec.calls["index"] == 1
-        out["G3 聊天图走守卫（已知被查）"] = rec.calls["known"] == 1
+        out["G3 read_file不再检查known或返回空占位"] = rec.calls["known"] == 0
         out["G3 聊天图最终调原函数"] = (r2 == "原始VLM描述")
 
         # G2b 表情包即使「已知媒体」也放行（不收口吞空）

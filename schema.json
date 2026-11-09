@@ -27,7 +27,61 @@
         "type": "float",
         "name": "消息合并间隔顺延（秒）",
         "default": -1,
-        "hint": "消息合并间隔顺延（buffer 防抖重置）：最后一条消息到达后 N 秒无新消息才 flush 成批次送 LLM，期间新消息到达重置倒计时。-1=自动取 WebUI 设置值并启用顺延；0=不启用顺延（按 WebUI 固定间隔）；>0=自定义秒数。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底"
+        "hint": "-1=取 WebUI 消息合并时间作为基准；0=不启用主消息顺延；正数=自定义基准。开启动态合并后，该值是初始值和调节中心，不再是每批固定等待"
+      },
+      "adaptive_merge_enabled": {
+        "type": "switch",
+        "name": "动态消息合并",
+        "default": true,
+        "hint": "默认开启。按近期同用户发言间隔调整合并窗口；持续/守望消息批、通知与队列自动攒批同步跟随"
+      },
+      "adaptive_merge_mode": {
+        "type": "string",
+        "name": "动态合并倾向",
+        "options": ["responsive", "balanced", "merge_first"],
+        "default": "balanced",
+        "hint": "responsive=P60（响应优先）、balanced=P75（均衡）、merge_first=P90（合并优先）；高分位通常合并更多但等待更久"
+      },
+      "adaptive_merge_max_seconds": {
+        "type": "float",
+        "name": "动态窗口上限（秒）",
+        "default": 0,
+        "minimum": 0,
+        "hint": "0=自动为基准值3倍；正数=自定义上限，实际不低于基准值"
+      },
+      "adaptive_merge_max_batch_wait": {
+        "type": "float",
+        "name": "单批最长等待（秒）",
+        "default": 0,
+        "minimum": 0,
+        "hint": "0=自动为基准值4倍；正数=自定义，实际不低于动态窗口上限。防止持续发言无限顺延"
+      },
+      "adaptive_merge_allow_below_base": {
+        "type": "switch",
+        "name": "允许低于基准值",
+        "default": false,
+        "hint": "默认关闭：窗口可回落到基准但不低于基准；开启后才允许低于基准"
+      },
+      "adaptive_merge_min_seconds": {
+        "type": "float",
+        "name": "最低动态窗口（秒）",
+        "default": 0,
+        "minimum": 0,
+        "hint": "仅允许低于基准时生效；0=自动为基准50%，正数=最低窗口，实际不高于基准值"
+      },
+      "adaptive_merge_sample_half_life_seconds": {
+        "type": "float",
+        "name": "学习样本半衰期（秒）",
+        "default": 480,
+        "minimum": 1,
+        "hint": "历史发言间隔每经过该秒数权重减半；越小越追随近期节奏，越大越重视历史"
+      },
+      "adaptive_merge_near_miss_ttl_seconds": {
+        "type": "float",
+        "name": "近失补偿有效期（秒）",
+        "default": 480,
+        "minimum": 0,
+        "hint": "上次刚推送就补充所产生的临时放大窗口有效期，过期后逐批回落；0=禁用该补偿"
       },
       "group_chat_prompt": {
         "name": "群聊额外提示词",
@@ -59,7 +113,7 @@
         "type": "switch",
         "name": "禁言静默感知（QQ增强）",
         "default": false,
-        "hint": "默认关 = 完全旧行为。开启后：解析 QQ增强的 [System …禁言了你N秒] / 解除禁言 notice；禁言期间暂停群持续/空停守望/私聊主动，且不武装守望；没收到 notice 时用发送失败（result.ok=False + 禁言/发言频率/1200）兜底静默 60s。解除通知提前清除。"
+        "hint": "默认关闭。禁言期间暂停群持续、空停守望和私聊主动；支持解除通知及发送失败兜底（60秒）"
       },
       "enable_manage_ignore": {
         "type": "switch",
@@ -102,7 +156,7 @@
         "name": "仅唤醒消息识图",
         "type": "switch",
         "default": false,
-        "hint": "为 true 时，只有唤醒消息中的图片/动画表情会保留（识别）；非唤醒消息中的全部替换为 [图片]。为 false 时，按概率和数量处理。"
+        "hint": "控制图片/表情的自动识别与呈现；按需读取开启后，非唤醒媒体不积极预取，但仍可由 read_media 主动读取。工具关闭时保持原行为"
       },
       "image_recognition_probability": {
         "name": "识图概率",
@@ -123,13 +177,63 @@
         "name": "仅唤醒消息解析转发",
         "type": "switch",
         "default": true,
-        "hint": "为 true 时，只有唤醒消息中的合并转发消息会被展开显示详细内容；非唤醒消息中的转发消息替换为 [转发消息]。为 false 时，所有转发消息都展开（注意：可能消耗较多 token）。"
+        "hint": "仅 forward_tool_enabled=false 时使用：开启=仅唤醒展开，关闭=全部展开。分层读取开启后统一显示外层摘要，均可按需展开"
+      },
+      "media_tool_image_enabled": {
+        "type": "switch",
+        "name": "图片/表情按需读取",
+        "default": false,
+        "hint": "开启后首轮使用 Image/Sticker 短ID占位，由 read_media 按需读取；支持积极预取和小批次直接呈现"
+      },
+      "media_tool_audio_enabled": {
+        "type": "switch",
+        "name": "语音按需读取",
+        "default": false,
+        "hint": "开启后语音使用 Record 短ID占位，由统一 read_media 读取；关闭则保持当前并行STT"
+      },
+      "media_tool_prefetch_enabled": {
+        "type": "switch",
+        "name": "积极预取媒体",
+        "default": true,
+        "hint": "开启后符合规则的媒体在后台并行预取；关闭后受控媒体仅由 read_media/read_forward 触发VLM/STT，原生直图仍由自动呈现开关控制"
+      },
+      "media_tool_auto_present_private_enabled": {
+        "type": "switch",
+        "name": "私聊小批次直接呈现",
+        "default": true,
+        "hint": "私聊中少量媒体或被@/引用/关键词唤醒时直接呈现，不额外调用工具"
+      },
+      "media_tool_auto_present_group_enabled": {
+        "type": "switch",
+        "name": "群聊小批次直接呈现",
+        "default": true,
+        "hint": "群聊中少量媒体或被@/引用/关键词唤醒时直接呈现，不额外调用工具"
+      },
+      "media_tool_auto_present_max_count": {
+        "type": "integer",
+        "name": "自动呈现数量阈值（每类）",
+        "default": 1,
+        "minimum": 1,
+        "hint": "图片+表情、语音分别计数；最终批次每类不超过N个时直接呈现，唤醒消息不受小批次阈值限制"
+      },
+      "forward_tool_enabled": {
+        "type": "switch",
+        "name": "合并记录分层按需读取",
+        "default": true,
+        "hint": "开启后保留 Forward 原树，首轮显示逐节点外层摘要，可用 read_forward 下钻；关闭则保持原仅唤醒解析规则"
+      },
+      "forward_max_depth": {
+        "type": "integer",
+        "name": "合并记录最大查看深度",
+        "default": 4,
+        "minimum": 1,
+        "hint": "允许 read_forward 下钻的最大层数（根为第1层），不是首轮自动展开层数"
       },
       "voice_recognition_only_on_mention": {
         "name": "仅唤醒消息识别语音（群聊）",
         "type": "switch",
         "default": false,
-        "hint": "为 true 时，只有唤醒消息中的语音会尝试识别；非唤醒消息中的语音替换为 [语音]。"
+        "hint": "控制群聊语音自动STT；语音按需读取开启后，非唤醒语音不积极预取，但仍可由统一 read_media 读取"
       },
       "voice_private_need_mention": {
         "name": "私聊需要引用才识别语音",
@@ -753,7 +857,7 @@
         "name": "超时合并(秒)",
         "type": "float",
         "default": 0,
-        "hint": "积压批次攒批达到该时长即合并推送（无论消息多少）；0=不攒批：当前批次一完成，积压批次全部合并推送，分批仅由下方各上限（批次数/消息数/token）控制。若要设置时间，建议值不超过所用 LLM 单次回复平均耗时的一半（如 LLM 回复通常需 10 秒，可设 5 秒）"
+        "hint": "0=自动：动态合并开启时跟随当前窗口，关闭时保持旧的立即合并；正数=手动固定攒批时间。动态到点不会打断仍在处理的批次"
       },
       "max_merge_batches_limit": {
         "name": "单次最大合并批次数",
@@ -944,13 +1048,6 @@
         "type": "boolean",
         "default": true,
         "hint": "避免触发原有 VLM 重复识别、浪费 token。默认开，如确有兼容需要可关闭。"
-      },
-      "guard_read_file_wait": {
-        "name": "read_file 拦截短等(秒)",
-        "type": "float",
-        "default": 8.0,
-        "minimum": 0.0,
-        "hint": "guard 拦截框架 read_file 补读插件已接管的媒体时，若该媒体正在识别中最多等待的秒数（等到即返回真描述）；0=不等直接返回空占位"
       }
     }
   },

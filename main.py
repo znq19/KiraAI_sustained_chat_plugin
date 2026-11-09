@@ -22,7 +22,7 @@ if _PLUGIN_DIR not in sys.path:
 # 热重载只重新 import main.py，sys.modules 里缓存的同目录模块不会更新；
 # 强制重载，避免改了 queue_merge / media_recognize / chat_enhance 后热重载不生效（AttributeError 等）
 import importlib
-for _m in ("queue_merge", "media_recognize", "chat_enhance", "jev"):
+for _m in ("adaptive_merge", "media_access", "queue_merge", "media_recognize", "chat_enhance", "jev"):
     if _m in sys.modules:
         try:
             importlib.reload(sys.modules[_m])
@@ -34,6 +34,7 @@ from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import KiraIMMessage, User, Group, Session, MessageChain
 from core.provider import LLMRequest, LLMResponse
 from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
+from adaptive_merge import AdaptiveMergePolicy
 from queue_merge import BatchMergeScheduler, restore_messages_to_buffer, elements_kw, adapter_supported_elements
 from media_recognize import ParallelMediaRecognizer
 from chat_enhance import ChatEnhanceEngine, _safe_int, _safe_float
@@ -132,6 +133,42 @@ class DebouncePlugin(BasePlugin):
                     logger.info(f"[Debounce] 迁移配置已写回: {_cfg_path}")
             except Exception as e:
                 logger.warning(f"[Debounce] 迁移写回配置文件失败（不影响本次运行）: {e}")
+
+    @property
+    def debounce_interval(self) -> float:
+        value = self.ctx.config.get_config("bot_config.bot.max_message_interval", None)
+        if value is None:
+            value = self.ctx.config["bot_config"].get("bot", {}).get("max_message_interval", 1.5)
+        return max(0.1, _safe_float(value, 1.5))
+
+    @property
+    def max_buffer_messages(self) -> int:
+        override = getattr(self, "_max_buffer_messages_override", None)
+        if override is not None:
+            return override
+        value = self.ctx.config.get_config("bot_config.bot.max_buffer_messages", None)
+        if value is None:
+            value = self.ctx.config["bot_config"].get("bot", {}).get("max_buffer_messages", 3)
+        return _safe_int(value, 3)
+
+    @max_buffer_messages.setter
+    def max_buffer_messages(self, value) -> None:
+        # 保留既有测试/外部定制直接赋值；正常路径实时读取 WebUI。
+        self._max_buffer_messages_override = _safe_int(value, 3)
+
+    def _merge_base_interval(self) -> float:
+        configured = getattr(self, "merge_window_seconds", -1)
+        return float(configured) if configured > 0 else self.debounce_interval
+
+    def _fixed_merge_window(self) -> float:
+        configured = getattr(self, "merge_window_seconds", -1)
+        return float(configured) if configured > 0 else self.debounce_interval
+
+    def _current_merge_window(self, sid: str) -> float:
+        policy = getattr(self, "adaptive_merge", None)
+        if policy is not None and policy.enabled:
+            return policy.current_window(sid)
+        return self._fixed_merge_window()
 
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
@@ -287,6 +324,9 @@ class DebouncePlugin(BasePlugin):
         self._watch_count: dict[str, int] = {}
         self._watch_full: dict[str, bool] = {}
         self._watch_reason: dict[str, str] = {}
+        self._watch_first_at: dict[str, float] = {}
+        self._watch_last_at: dict[str, float] = {}
+        self._watch_anchor_uid: dict[str, str] = {}
         # 禁言静默：sid -> until_ts；QQ增强的 [System …禁言了你N秒] / 发送失败兜底都写入
         self._muted_until: dict[str, float] = {}
         self._mute_reason: dict[str, str] = {}
@@ -330,22 +370,16 @@ class DebouncePlugin(BasePlugin):
         #   TTL + 上限见 _remember_real_batch（防长时间运行无界增长）。
         self._real_batches: dict[str, float] = {}
         bot_cfg = ctx.config["bot_config"].get("bot", {})
-        self.debounce_interval = _safe_float(bot_cfg.get("max_message_interval"), 1.5)
-        self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
-        # 消息合并间隔顺延：从 section_basic 读取
+        # 消息合并间隔顺延：-1 始终按需读取 WebUI 基准，不保存全局配置快照。
         _basic = cfg.get("section_basic", {}) or {}
         _mws = _basic.get("merge_window_seconds", -1)
-        if _mws is None or _mws == -1:
-            # -1 = 自动取框架值启用顺延
-            self.merge_window_seconds = self.debounce_interval
-        elif _mws == 0:
-            # 0 = 不启用顺延（按框架默认走一次固定间隔）
-            self.merge_window_seconds = 0
-        else:
-            # >0 = 自定义顺延秒数
-            self.merge_window_seconds = float(_mws)
-        # 顺延调试日志：section_basic.debug_log_enabled（独立开关，默认关）
+        self.merge_window_seconds = -1.0 if _mws is None or _mws == -1 else float(_mws)
         self._merge_debug = _basic.get("debug_log_enabled", False)
+        self.adaptive_merge = AdaptiveMergePolicy(self._merge_base_interval, _basic)
+        # 当前批次的单调时钟状态；只有消息真正落缓冲后才更新。
+        self._merge_first_at: dict[str, float] = {}
+        self._merge_last_at: dict[str, float] = {}
+        self._merge_anchor_uid: dict[str, str] = {}
 
         # 群聊持续状态
         self.sustain_until = defaultdict(float)
@@ -372,8 +406,9 @@ class DebouncePlugin(BasePlugin):
 
         # 队列合并 / 积压处理（BatchMergeScheduler）
         self.merge_scheduler = BatchMergeScheduler(ctx, cfg, bot_cfg)
+        self.merge_scheduler.adaptive_policy = self.adaptive_merge
         # 并行媒体识别（ParallelMediaRecognizer）
-        self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg)
+        self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg, plugin_id=_SELF_PLUGIN_ID)
         # 供「丢弃积压批次时取消在飞预取」使用（被丢弃的那批不会进 LLM，别白烧 VLM）
         self.merge_scheduler.media_recognizer = self.media_recognizer
         # 预取受「媒体预处理合并限制」开关控制（关掉它 = 不预取）
@@ -435,7 +470,7 @@ class DebouncePlugin(BasePlugin):
                    "extra_default_duration", "extra_max_duration", "extra_allow_bot_duration"):
             if _k in _th:
                 _enhance_cfg[_k] = _th[_k]
-        self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
+        self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self._current_merge_window)
 
         # ignore/wake_extend tag 的会话上下文：sid -> (token, timestamp)。
         # 框架 tag 处理器签名只有 (value, **attrs) 无 event 上下文，旧实现用单一
@@ -1297,7 +1332,7 @@ class DebouncePlugin(BasePlugin):
                 return
             if decision == "reply":
                 logger.info(f"[JEV] 私聊空停守望 {sid} 判定 reply：重新接话")
-                await self.ctx.flush_session_messages(sid)
+                await self._flush_buffer(sid)
             else:
                 logger.info(
                     f"[JEV] 私聊空停守望 {sid} 判定 {decision or '弃权/失败'}："
@@ -1975,7 +2010,7 @@ class DebouncePlugin(BasePlugin):
             else:
                 logger.info(f"[JEV] {scene} {sid} 判定触发（机械={mechanical_hit} → JEV={decision}）")
             try:
-                await self.ctx.flush_session_messages(sid)
+                await self._flush_buffer(sid)
             except Exception:
                 logger.exception(f"[JEV] {scene} {sid} flush 失败")
         except Exception as e:
@@ -2008,6 +2043,9 @@ class DebouncePlugin(BasePlugin):
         self._watch_count.pop(sid, None)
         self._watch_full.pop(sid, None)
         self._watch_reason.pop(sid, None)
+        self._watch_first_at.pop(sid, None)
+        self._watch_last_at.pop(sid, None)
+        self._watch_anchor_uid.pop(sid, None)
         # 事件对象也回收：每会话一个 Event，长跑/多会话下不回收会缓慢累积
         self._watch_events.pop(sid, None)
         t = self._watch_tasks.get(sid)
@@ -2059,6 +2097,9 @@ class DebouncePlugin(BasePlugin):
             self._watch_since[sid] = set()
         self._watch_count[sid] = 0
         self._watch_full.pop(sid, None)
+        self._watch_first_at.pop(sid, None)
+        self._watch_last_at.pop(sid, None)
+        self._watch_anchor_uid.pop(sid, None)
         self._watch_reason[sid] = str(reason or "")
         logger.info(f"[JEV] 空停守望已武装: {sid}（只判停窗后的第一批消息，判完即解除）")
 
@@ -2074,6 +2115,13 @@ class DebouncePlugin(BasePlugin):
                 return
         except Exception:
             pass
+        now = time.monotonic()
+        uid = getattr(event.message, "_adaptive_merge_uid", None)
+        if self._watch_count.get(sid, 0) == 0:
+            self._watch_first_at[sid] = now
+            self._watch_anchor_uid[sid] = "" if uid is None else str(uid)
+            self.adaptive_merge.start_batch(sid, uid, now)
+        self._watch_last_at[sid] = now
         self._watch_count[sid] = self._watch_count.get(sid, 0) + 1
         if self.max_buffer_messages > 0 and \
                 self._watch_count.get(sid, 0) >= self.max_buffer_messages:
@@ -2087,34 +2135,38 @@ class DebouncePlugin(BasePlugin):
         self._watch_events[sid].set()
 
     async def _watch_loop(self, sid: str, gen: int) -> None:
-        """守望顺延：最后一条消息后 merge_window 秒无新消息（或满即推）→ 触发判断。
-
-        结构说明（2026-11-08 修）：满即推的提前结束**不能**用 `break` 跳出
-        外层等待循环——旧写法会把后面的世代校验与 `_watch_fire` 一起跳过
-        （W4 测试实测：满批后 JEV 完全没被调用）。这里改成「先决定是否还要等，
-        再统一走校验 + fire」，只有一条出口。
-        """
+        """守望批次与主 buffer 共用当前动态窗口和整批等待上限。"""
         event = self._watch_events.get(sid)
         if event is None:
             return
-        window = self.merge_window_seconds if self.merge_window_seconds > 0 else self.debounce_interval
-        window = max(0.5, float(window))
         try:
             await event.wait()
             event.clear()
-            # 满即推必须在第一次等待前检查：用户连发到 max_buffer_messages 时，
-            # event 只表示"最后一条到了"，若先进入 wait_for 就会白等一整个合并窗口。
             if not self._watch_full.get(sid):
                 while True:
+                    now = time.monotonic()
+                    first = self._watch_first_at.get(sid, now)
+                    last = self._watch_last_at.get(sid, now)
+                    uid = self._watch_anchor_uid.get(sid) or None
+                    deadline, _reason, window = self.adaptive_merge.timing(
+                        sid, first, last, uid, now)
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        break
                     try:
-                        await asyncio.wait_for(event.wait(), timeout=window)
+                        await asyncio.wait_for(event.wait(), timeout=remaining)
                     except asyncio.TimeoutError:
-                        break                        # 到点
-                    event.clear()
-                    if self._watch_full.get(sid):
-                        break                        # 满即推
-                    # 新消息到达 → 顺延重置（继续等一个完整窗口）
-            # 世代/闩锁校验：期间真唤醒或新停止 ⇒ 自动放弃
+                        pass
+                    if event.is_set():
+                        event.clear()
+                        if self._watch_full.get(sid):
+                            break
+                        continue
+                    # 到原截止点重读基准；调大时继续等，避免旧窗口误触发。
+                    if self.adaptive_merge.timing(
+                            sid, first, last, uid, time.monotonic())[0] > time.monotonic():
+                        continue
+                    break
             if gen != self._watch_gen.get(sid, -1) or not self.sustain_stopped.get(sid):
                 return
             await self._watch_fire(sid, gen)
@@ -2177,7 +2229,7 @@ class DebouncePlugin(BasePlugin):
                 self.sustain_hit_ids.pop(sid, None)
                 self._watch_disarm(sid)
                 try:
-                    await self.ctx.flush_session_messages(sid)
+                    await self._flush_buffer(sid)
                 except Exception:
                     logger.exception(f"[JEV] 守望 flush 失败: {sid}")
             else:
@@ -2883,6 +2935,8 @@ class DebouncePlugin(BasePlugin):
                                 else:
                                     logger.debug(f"[Sustain] 群 {sid} 持续对话未命中，本窗口不再判断")
 
+        self._mark_adaptive_message(event)
+
         # === 消息缓冲逻辑（"前文 + 批次"模型） ===
         # ① 前文（max_unmentioned_messages）：唤醒消息【之前】的非唤醒消息，最多保留
         #    max_unmentioned_messages 条（超限弹最老前文），唤醒出现后前文锁定不再裁剪。
@@ -2917,6 +2971,7 @@ class DebouncePlugin(BasePlugin):
                     # 批次计数 +1，满即推检查
                     self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
                     if self.max_buffer_messages > 0 and self.batch_count[sid] >= self.max_buffer_messages:
+                        self._adaptive_direct_flush(sid, event, "count")
                         event.flush()
                         # 批次已满即推，清理批次状态（下一批从 0 开始）
                         self.batch_started.pop(sid, None)
@@ -2963,6 +3018,7 @@ class DebouncePlugin(BasePlugin):
                             logger.info("[Chat] Triggered proactive chat")
                             # 本条会被立即推出（连同它的媒体）→ 补预取标记（stage1 末尾调度）
                             event.message._batch_entered = True
+                            self._adaptive_direct_flush(sid, event, "proactive")
                             event.flush()
                     elif self.jev_enabled and self._jev_mode_has(self.jev_proactive_mode, "boost"):
                         # JEV 补触发（后台）：机械未命中时给一次语义补判，reply 才 flush
@@ -2992,6 +3048,80 @@ class DebouncePlugin(BasePlugin):
             #   现在就把它们的媒体预热（后台识别，与本条 stage1 登记并行），放行时零识别开销。
             self._warmup_context_media(sid, event)
 
+    # ========== 动态消息合并：只观察真实用户，不在消息钩子里做 I/O ==========
+    def _mark_adaptive_message(self, event) -> None:
+        message = getattr(event, "message", None)
+        sender = getattr(message, "sender", None)
+        uid = getattr(sender, "user_id", None) if sender is not None else None
+        if uid is None or getattr(event, "is_notice", False) or getattr(message, "is_notice", False):
+            return
+        uid = str(uid)
+        if uid in ("system_proactive_dm", "system_scheduled"):
+            return
+        message._adaptive_merge_uid = uid
+
+    def _adaptive_observe_message(self, sid: str, message, now: float):
+        uid = getattr(message, "_adaptive_merge_uid", None)
+        if uid is None:
+            return None
+        try:
+            delattr(message, "_adaptive_merge_uid")
+        except Exception:
+            pass
+        self.adaptive_merge.observe(sid, uid, now)
+        return uid
+
+    def _adaptive_collect_buffer(self, sid: str, now: float):
+        latest_uid = None
+        buf = self.ctx.get_buffer(sid)
+        for item in list(getattr(buf, "buffer", None) or []):
+            message = getattr(item, "message", item)
+            uid = self._adaptive_observe_message(sid, message, now)
+            if uid is not None:
+                latest_uid = uid
+        return latest_uid
+
+    def _adaptive_touch_batch(self, sid: str, uid, now: float) -> None:
+        if sid not in self._merge_first_at:
+            self._merge_first_at[sid] = now
+            self._merge_anchor_uid[sid] = "" if uid is None else str(uid)
+            self.adaptive_merge.start_batch(sid, uid, now)
+        self._merge_last_at[sid] = now
+
+    def _adaptive_clear_batch(self, sid: str) -> None:
+        self._merge_first_at.pop(sid, None)
+        self._merge_last_at.pop(sid, None)
+        self._merge_anchor_uid.pop(sid, None)
+
+    def _adaptive_note_flush(self, sid: str, reason: str, now: float | None = None,
+                             uid=None, last_at: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        uid = uid if uid is not None else self._merge_anchor_uid.get(sid)
+        if last_at is None:
+            last_at = self._merge_last_at.get(sid, now)
+        self.adaptive_merge.note_flush(sid, uid, last_at, reason, now)
+        self._adaptive_clear_batch(sid)
+
+    def _adaptive_direct_flush(self, sid: str, event, reason: str) -> None:
+        now = time.monotonic()
+        uid = self._adaptive_observe_message(sid, event.message, now)
+        if self.batch_started.get(sid, False):
+            self._adaptive_touch_batch(sid, uid, now)
+        self._adaptive_note_flush(sid, reason, now, uid=uid, last_at=now)
+
+    def _adaptive_deadline(self, sid: str, now: float):
+        if sid not in self._merge_last_at:
+            # 外部/旧路径若直接武装任务，也必须固定一个起点，不能每次用 now 顺延。
+            self._adaptive_touch_batch(sid, None, now)
+        first = self._merge_first_at.get(sid, now)
+        last = self._merge_last_at.get(sid, now)
+        uid = self._merge_anchor_uid.get(sid) or None
+        return self.adaptive_merge.timing(sid, first, last, uid, now)
+
+    async def _flush_buffer(self, sid: str, reason: str = "external"):
+        self._adaptive_note_flush(sid, reason)
+        return await self.ctx.flush_session_messages(sid)
+
     def _warmup_context_media(self, sid: str, event) -> None:
         """起批时把缓冲里「前文」的媒体丢进预取池（它们会随本批一起送进 LLM）。
 
@@ -3018,17 +3148,10 @@ class DebouncePlugin(BasePlugin):
 
     @on.message_buffered(priority=Priority.HIGH)
     async def on_buffered(self, sid: str, *_):
-        """消息真正落缓冲后：确立批次状态 + 启动/重置顺延（Fix 1 的唯一武装点）。
-
-        框架只在全部 ON_IM_MESSAGE 钩子跑完后才 buffer.add 并随即派发本事件
-        （core/message_manager.py handle_im_message）——以此刻为批次/顺延的武装点，
-        「顺延窗口到点」必然晚于「消息落地」，handle_msg 与缓冲落地之间的竞态根除：
-          · 唤醒消息（handle_msg 打了 _wake_pending）：确立/累加批次计数，满即推；
-          · 批次已开启时任何消息落地：重置顺延（语义 = 最后一条**进缓冲**后
-            N 秒无新消息才 flush，比旧的「进钩子」起算更准）；
-          · 纯前文（批次未开启）：不启动顺延（保险丝语义不变）。
-        """
+        """消息落地后才学习并武装顺延，保留既有批次与停窗保险丝。"""
         try:
+            now = time.monotonic()
+            latest_uid = self._adaptive_collect_buffer(sid, now)
             buf = self.ctx.get_buffer(sid)
             items = getattr(buf, "buffer", None) or []
             for _it in list(items):
@@ -3039,29 +3162,29 @@ class DebouncePlugin(BasePlugin):
                     delattr(_m, "_wake_pending")
                 except Exception:
                     pass
-                # 停窗后迟到的「持续命中」消息不确立批次（不回一轮，留作前文等下次
-                # 真唤醒带走）——与 QueueMerge.drop_sustain_pending 同判定，此处是缓冲层
                 if self.sustain_stopped.get(sid):
                     _hits = self.sustain_hit_ids.get(sid) or set()
                     _mid = getattr(_m, "message_id", None)
                     if _mid is not None and _mid in _hits:
                         continue
                 if not self.batch_started.get(sid, False):
+                    self._adaptive_clear_batch(sid)
                     self.batch_started[sid] = True
                     self.batch_count[sid] = 1
                 else:
                     self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
-                # 满即推：批次计数达到上限立即刷出（此刻消息已在缓冲，直接 flush）
                 if self.max_buffer_messages > 0 and self.batch_count[sid] >= self.max_buffer_messages:
+                    self._adaptive_touch_batch(sid, latest_uid, now)
                     self.batch_started.pop(sid, None)
                     self.batch_count.pop(sid, None)
                     try:
-                        await self.ctx.flush_session_messages(sid)
+                        await self._flush_buffer(sid, "count")
                     except Exception:
                         logger.exception(f"[Debounce] Error flushing session {sid}")
                     return
             if not self.batch_started.get(sid, False):
                 return
+            self._adaptive_touch_batch(sid, latest_uid, now)
             if sid not in self.session_events:
                 self.session_events[sid] = asyncio.Event()
             if sid not in self.session_tasks or self.session_tasks[sid].done():
@@ -3076,58 +3199,57 @@ class DebouncePlugin(BasePlugin):
             while True:
                 await event.wait()
                 event.clear()
-                if self.merge_window_seconds > 0:
-                    # 消息合并间隔顺延：新消息到达时重置计时器
-                    if self._merge_debug:
-                        logger.info(f"[Debounce] 顺延开始 session={sid}, 窗口={self.merge_window_seconds}s")
-                    remaining = self.merge_window_seconds
-                    while remaining > 0:
+                flush_reason = "fixed"
+                if self.merge_window_seconds != 0:
+                    # deadline 由 on_buffered 在消息落地后更新；配置或学习变化只在
+                    # 唤醒/原截止点重算，不需要轮询，也不会把唤醒误当成新消息。
+                    while True:
+                        now = time.monotonic()
+                        deadline, flush_reason, window = self._adaptive_deadline(sid, now)
+                        if self._merge_debug:
+                            logger.info(f"[Debounce] 等待 session={sid}, 窗口={window:.2f}s, 原因={flush_reason}")
+                        if self.max_buffer_messages > 0 and self.batch_count.get(sid, 0) >= self.max_buffer_messages:
+                            flush_reason = "count"
+                            break
+                        remaining = deadline - now
+                        if remaining <= 0:
+                            break
                         try:
                             await asyncio.wait_for(event.wait(), timeout=remaining)
+                        except asyncio.TimeoutError:
+                            pass
+                        if event.is_set():
                             event.clear()
                             if self._merge_debug:
-                                logger.info(f"[Debounce] 顺延重置 session={sid}（新消息到达，重新等待 {self.merge_window_seconds}s）")
-                            remaining = self.merge_window_seconds
-                        except asyncio.TimeoutError:
-                            break
-                        # 满即推安全阀：顺延等待中批次计数达到 max_buffer_messages，提前结束顺延
-                        if self.max_buffer_messages > 0 and self.batch_count.get(sid, 0) >= self.max_buffer_messages:
-                            if self._merge_debug:
-                                logger.info(
-                                    f"[Debounce] 顺延提前结束（批次 {self.batch_count.get(sid, 0)} 条 ≥ 上限 {self.max_buffer_messages}）: {sid}"
-                                )
-                            break
-                else:
-                    # 0 = 不启用顺延，固定间隔 flush（框架原行为）
-                    try:
-                        await asyncio.sleep(self.debounce_interval)
-                    except asyncio.CancelledError:
+                                logger.info(f"[Debounce] 顺延重置 session={sid}")
+                            continue
+                        # 原截止点再读一次当前配置：调大可避免误 flush；调小在无
+                        # configChanged 事件时最迟等到旧截止点，下一条消息会立即重算。
+                        if self._adaptive_deadline(sid, time.monotonic())[0] > time.monotonic():
+                            continue
                         break
+                else:
+                    # 0 = 不启用顺延，固定间隔 flush（框架原行为），但读取当前 WebUI 值。
+                    await asyncio.sleep(self.debounce_interval)
                 if event.is_set() and not self.receive_unmentioned:
                     continue
                 buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
                 if buffer_len == 0:
-                    # 批次已被外部消费（框架/其他插件在顺延窗口内 flush 了批次）：
-                    # 清理批次状态防止残留 —— 否则 batch_started 遗留 True 会让
-                    # 后续非唤醒消息被误当作"批次内消息"重置顺延 → flush 进 LLM
                     self.batch_started.pop(sid, None)
                     self.batch_count.pop(sid, None)
+                    self._adaptive_clear_batch(sid)
                     continue
-                # 保险丝：flush 只发生在"批次由唤醒/持续命中开启"时；无唤醒来历
-                # （纯围观消息）不 flush，只留作前文等下次真唤醒。防任何路径误触发。
                 if not self.batch_started.get(sid, False):
+                    self._adaptive_clear_batch(sid)
                     if self._merge_debug:
-                        logger.debug(
-                            f"[Debounce] 未检测到唤醒来历批次，跳过 flush（前文保留）: {sid}"
-                        )
+                        logger.debug(f"[Debounce] 无唤醒来历批次，保留前文: {sid}")
                     continue
                 if self._merge_debug:
-                    logger.info(f"[Debounce] 顺延结束 session={sid}（{self.merge_window_seconds}s 无新消息），flush {buffer_len} 条")
+                    logger.info(f"[Debounce] 合并结束 session={sid}（{flush_reason}），flush {buffer_len} 条")
                 try:
-                    await self.ctx.flush_session_messages(sid)
+                    await self._flush_buffer(sid, flush_reason)
                 except Exception:
                     logger.exception(f"[Debounce] Error flushing session {sid}")
-                # 批次已随 flush 送出，清理批次状态（下一批从 0 开始）
                 self.batch_started.pop(sid, None)
                 self.batch_count.pop(sid, None)
         except asyncio.CancelledError:
@@ -3137,6 +3259,7 @@ class DebouncePlugin(BasePlugin):
             self.session_events.pop(sid, None)
             self.batch_started.pop(sid, None)
             self.batch_count.pop(sid, None)
+            self._adaptive_clear_batch(sid)
 
     # ========== LLM 响应钩子 ==========
 
@@ -3377,6 +3500,58 @@ class DebouncePlugin(BasePlugin):
                     f"[Sustain] 群 {sid} 已达最大持续次数 "
                     f"{self.sustain_count.get(sid, 0)}/{self.max_sustain_replies}，不再开窗"
                 )
+
+    # ========== 按需媒体 / Forward 工具 ==========
+    @register.tool(
+        name="read_media",
+        description="按 ID 批量读取图片、动画表情或语音。消息含 [Image #id: 可读取]、[Sticker #id: 可读取]、[Record #id: 可读取] 且你需要其内容时调用。",
+        params={"type": "object", "properties": {"media_ids": {
+            "type": "array", "items": {"type": "string"},
+            "description": "一个或多个媒体 ID；同批多个媒体请一次传入，避免反复调用",
+        }}, "required": ["media_ids"]},
+    )
+    async def read_media(self, event: KiraMessageBatchEvent, media_ids=None, **_):
+        return await self.media_recognizer.access.read_media(event, media_ids)
+
+    @register.tool(
+        name="read_forward",
+        description="按需展开一个或多个合并聊天记录，内部并行处理。depth=1看当前层，N=向下N层，-1=拉取允许范围内全部剩余层；分页时传返回的 cursor。",
+        params={"type": "object", "properties": {
+            "forward_id": {"type": "string", "description": "单记录兼容参数：Forward #id 中的 id"},
+            "forward_ids": {"type": "array", "items": {"type": "string"},
+                            "description": "可选：多个 Forward ID，一次并行读取"},
+            "depth": {"type": "integer", "default": 1},
+            "cursor": {"type": "string", "description": "分页游标或多记录游标JSON，可选"},
+        }, "required": []},
+    )
+    async def read_forward(self, event: KiraMessageBatchEvent, forward_id=None,
+                           depth: int = 1, cursor=None, forward_ids=None, **_):
+        return await self.media_recognizer.access.read_forward(
+            event, forward_id=forward_id, forward_ids=forward_ids, depth=depth, cursor=cursor)
+
+    @on.llm_request(priority=Priority.HIGH)
+    async def filter_access_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        access = self.media_recognizer.access
+        if not (access.image_tool_enabled or access.audio_tool_enabled):
+            self._filter_tools(req.tool_set, ["read_media"], "exact")
+        if not access.forward_tool_enabled:
+            self._filter_tools(req.tool_set, ["read_forward"], "exact")
+        hints = []
+        if access.image_tool_enabled or access.audio_tool_enabled:
+            hints.append("消息中的 [Image/Sticker/Record #id: 可读取] 可用 read_media 批量读取。")
+        if access.forward_tool_enabled:
+            hints.append("消息中的 [Forward #id: ...] 可用 read_forward 展开；depth=-1 可读允许范围内全部剩余层。")
+        if not hints:
+            return
+        for p in req.system_prompt:
+            if getattr(p, "name", "") == "chat_env" and not getattr(p, "_media_access_hint_added", False):
+                p.content = (p.content or "") + "\n" + "\n".join(hints)
+                p.render_template = False
+                try:
+                    p._media_access_hint_added = True
+                except Exception:
+                    pass
+                break
 
     # ========== LLM 请求钩子（工具黑名单过滤） ==========
     @on.llm_request(priority=Priority.HIGH)
@@ -3735,12 +3910,22 @@ class DebouncePlugin(BasePlugin):
             for i, elem in enumerate(chain.message_list):
                 if isinstance(elem, Image):
                     if self.image_recognition_only_on_mention and not is_mentioned:
-                        chain.message_list[i] = Text("[Image attached]")
+                        if self.media_recognizer.access.image_tool_enabled:
+                            elem._media_skip = True
+                            elem._media_skip_reason = "mention"
+                        else:
+                            chain.message_list[i] = Text("[Image attached]")
                 elif isinstance(elem, Sticker):
                     if (self.image_recognition_only_on_mention and self.native_sticker_follow_mention
                             and not is_mentioned):
-                        chain.message_list[i] = Text("[Sticker attached]")
+                        if self.media_recognizer.access.image_tool_enabled:
+                            elem._media_skip = True
+                            elem._media_skip_reason = "mention"
+                        else:
+                            chain.message_list[i] = Text("[Sticker attached]")
                 elif isinstance(elem, Forward):
+                    if self.media_recognizer.access.forward_tool_enabled:
+                        continue
                     if self.forward_recognition_only_on_mention and not is_mentioned:
                         chain.message_list[i] = Text("[转发消息]")
                 elif isinstance(elem, Record):
@@ -3764,6 +3949,9 @@ class DebouncePlugin(BasePlugin):
                         elem._media_skip_reason = "probability"
                         elem.caption = ""  # 阻止框架渲染时自动 VLM
             elif isinstance(elem, Forward):
+                # 工具模式保留原树；旧开关仅用于工具关闭的传统路径。
+                if self.media_recognizer.access.forward_tool_enabled:
+                    continue
                 # only_on_mention=True：仅唤醒消息保留转发；False：全部保留
                 if self.forward_recognition_only_on_mention and not is_mentioned:
                     chain.message_list[i] = Text("[转发消息]")
