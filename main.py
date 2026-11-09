@@ -22,7 +22,7 @@ if _PLUGIN_DIR not in sys.path:
 # 热重载只重新 import main.py，sys.modules 里缓存的同目录模块不会更新；
 # 强制重载，避免改了 queue_merge / media_recognize / chat_enhance 后热重载不生效（AttributeError 等）
 import importlib
-for _m in ("adaptive_merge", "queue_merge", "media_recognize", "chat_enhance", "jev"):
+for _m in ("adaptive_merge", "media_access", "queue_merge", "media_recognize", "chat_enhance", "jev"):
     if _m in sys.modules:
         try:
             importlib.reload(sys.modules[_m])
@@ -408,7 +408,7 @@ class DebouncePlugin(BasePlugin):
         self.merge_scheduler = BatchMergeScheduler(ctx, cfg, bot_cfg)
         self.merge_scheduler.adaptive_policy = self.adaptive_merge
         # 并行媒体识别（ParallelMediaRecognizer）
-        self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg)
+        self.media_recognizer = ParallelMediaRecognizer(ctx, cfg, bot_cfg, plugin_id=_SELF_PLUGIN_ID)
         # 供「丢弃积压批次时取消在飞预取」使用（被丢弃的那批不会进 LLM，别白烧 VLM）
         self.merge_scheduler.media_recognizer = self.media_recognizer
         # 预取受「媒体预处理合并限制」开关控制（关掉它 = 不预取）
@@ -3501,6 +3501,55 @@ class DebouncePlugin(BasePlugin):
                     f"{self.sustain_count.get(sid, 0)}/{self.max_sustain_replies}，不再开窗"
                 )
 
+    # ========== 按需媒体 / Forward 工具 ==========
+    @register.tool(
+        name="read_media",
+        description="按 ID 批量读取图片、动画表情或语音。消息含 [Image #id: 可读取]、[Sticker #id: 可读取]、[Record #id: 可读取] 且你需要其内容时调用。",
+        params={"type": "object", "properties": {"media_ids": {
+            "type": "array", "items": {"type": "string"},
+            "description": "一个或多个媒体 ID；同批多个媒体请一次传入，避免反复调用",
+        }}, "required": ["media_ids"]},
+    )
+    async def read_media(self, event: KiraMessageBatchEvent, media_ids=None, **_):
+        return await self.media_recognizer.access.read_media(event, media_ids)
+
+    @register.tool(
+        name="read_forward",
+        description="按需展开合并聊天记录。depth=1看当前层，N=向下N层，-1=拉取允许范围内全部剩余层；分页时传返回的 cursor。",
+        params={"type": "object", "properties": {
+            "forward_id": {"type": "string", "description": "Forward #id 中的 id"},
+            "depth": {"type": "integer", "default": 1},
+            "cursor": {"type": "string", "description": "分页游标，可选"},
+        }, "required": ["forward_id"]},
+    )
+    async def read_forward(self, event: KiraMessageBatchEvent, forward_id: str,
+                           depth: int = 1, cursor=None, **_):
+        return await self.media_recognizer.access.read_forward(event, forward_id, depth, cursor)
+
+    @on.llm_request(priority=Priority.HIGH)
+    async def filter_access_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        access = self.media_recognizer.access
+        if not (access.image_tool_enabled or access.audio_tool_enabled):
+            self._filter_tools(req.tool_set, ["read_media"], "exact")
+        if not access.forward_tool_enabled:
+            self._filter_tools(req.tool_set, ["read_forward"], "exact")
+        hints = []
+        if access.image_tool_enabled or access.audio_tool_enabled:
+            hints.append("消息中的 [Image/Sticker/Record #id: 可读取] 可用 read_media 批量读取。")
+        if access.forward_tool_enabled:
+            hints.append("消息中的 [Forward #id: ...] 可用 read_forward 展开；depth=-1 可读允许范围内全部剩余层。")
+        if not hints:
+            return
+        for p in req.system_prompt:
+            if getattr(p, "name", "") == "chat_env" and not getattr(p, "_media_access_hint_added", False):
+                p.content = (p.content or "") + "\n" + "\n".join(hints)
+                p.render_template = False
+                try:
+                    p._media_access_hint_added = True
+                except Exception:
+                    pass
+                break
+
     # ========== LLM 请求钩子（工具黑名单过滤） ==========
     @on.llm_request(priority=Priority.HIGH)
     async def filter_proactive_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
@@ -3858,12 +3907,22 @@ class DebouncePlugin(BasePlugin):
             for i, elem in enumerate(chain.message_list):
                 if isinstance(elem, Image):
                     if self.image_recognition_only_on_mention and not is_mentioned:
-                        chain.message_list[i] = Text("[Image attached]")
+                        if self.media_recognizer.access.image_tool_enabled:
+                            elem._media_skip = True
+                            elem._media_skip_reason = "mention"
+                        else:
+                            chain.message_list[i] = Text("[Image attached]")
                 elif isinstance(elem, Sticker):
                     if (self.image_recognition_only_on_mention and self.native_sticker_follow_mention
                             and not is_mentioned):
-                        chain.message_list[i] = Text("[Sticker attached]")
+                        if self.media_recognizer.access.image_tool_enabled:
+                            elem._media_skip = True
+                            elem._media_skip_reason = "mention"
+                        else:
+                            chain.message_list[i] = Text("[Sticker attached]")
                 elif isinstance(elem, Forward):
+                    if self.media_recognizer.access.forward_tool_enabled:
+                        continue
                     if self.forward_recognition_only_on_mention and not is_mentioned:
                         chain.message_list[i] = Text("[转发消息]")
                 elif isinstance(elem, Record):
@@ -3887,6 +3946,9 @@ class DebouncePlugin(BasePlugin):
                         elem._media_skip_reason = "probability"
                         elem.caption = ""  # 阻止框架渲染时自动 VLM
             elif isinstance(elem, Forward):
+                # 工具模式保留原树；旧开关仅用于工具关闭的传统路径。
+                if self.media_recognizer.access.forward_tool_enabled:
+                    continue
                 # only_on_mention=True：仅唤醒消息保留转发；False：全部保留
                 if self.forward_recognition_only_on_mention and not is_mentioned:
                     chain.message_list[i] = Text("[转发消息]")
