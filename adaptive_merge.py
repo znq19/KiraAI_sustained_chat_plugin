@@ -28,8 +28,8 @@ class AdaptiveMergePolicy:
     reload.  Runtime values are never written back to the global config.
     """
 
-    SAMPLE_HALF_LIFE = 600.0
-    BOOST_TTL = 600.0
+    SAMPLE_HALF_LIFE = 480.0
+    BOOST_TTL = 480.0
     MIN_SAMPLES = 4
     MAX_PROFILES = 2048
     MAX_SESSIONS = 2048
@@ -43,6 +43,11 @@ class AdaptiveMergePolicy:
         self.max_batch_wait_override = self._nonnegative(cfg.get("adaptive_merge_max_batch_wait", 0))
         self.allow_below_base = bool(cfg.get("adaptive_merge_allow_below_base", False))
         self.min_window_override = self._nonnegative(cfg.get("adaptive_merge_min_seconds", 0))
+        half_life = self._nonnegative(cfg.get(
+            "adaptive_merge_sample_half_life_seconds", self.SAMPLE_HALF_LIFE))
+        self.sample_half_life_seconds = max(1.0, half_life or self.SAMPLE_HALF_LIFE)
+        self.near_miss_ttl_seconds = self._nonnegative(cfg.get(
+            "adaptive_merge_near_miss_ttl_seconds", self.BOOST_TTL))
         self._profiles: dict[tuple[str, str], _Profile] = {}
         # sid -> [base used, current window, anchor sender]
         self._windows: dict[str, list] = {}
@@ -95,12 +100,13 @@ class AdaptiveMergePolicy:
         return {"responsive": 0.60, "balanced": 0.75, "merge_first": 0.90}[self.mode]
 
     @staticmethod
-    def _weighted_quantile(samples, now: float, quantile: float):
+    def _weighted_quantile(samples, now: float, quantile: float,
+                           half_life: float = SAMPLE_HALF_LIFE):
         weighted = []
         total = 0.0
         for ts, gap in samples:
             age = max(0.0, now - ts)
-            weight = 2.0 ** (-age / AdaptiveMergePolicy.SAMPLE_HALF_LIFE)
+            weight = 2.0 ** (-age / max(1.0, half_life))
             if weight <= 0:
                 continue
             weighted.append((gap, weight))
@@ -153,7 +159,7 @@ class AdaptiveMergePolicy:
                 boost = min(self.max_interval(base), raw_gap + self.margin(base))
                 if boost >= profile.boost_window or now >= profile.boost_until:
                     profile.boost_window = boost
-                profile.boost_until = now + self.BOOST_TTL
+                profile.boost_until = now + self.near_miss_ttl_seconds
 
         previous_arrival = profile.last_arrival
         if previous_arrival is not None:
@@ -186,7 +192,8 @@ class AdaptiveMergePolicy:
         if selected is None:
             target = base
         else:
-            learned, effective_n = self._weighted_quantile(selected.samples, now, self.quantile)
+            learned, effective_n = self._weighted_quantile(
+                selected.samples, now, self.quantile, self.sample_half_life_seconds)
             if learned is None:
                 target = base
             else:
@@ -259,4 +266,6 @@ class AdaptiveMergePolicy:
             "max": self.max_interval(base),
             "max_batch_wait": self.max_batch_wait(base),
             "allow_below_base": self.allow_below_base,
+            "sample_half_life_seconds": self.sample_half_life_seconds,
+            "near_miss_ttl_seconds": self.near_miss_ttl_seconds,
         }

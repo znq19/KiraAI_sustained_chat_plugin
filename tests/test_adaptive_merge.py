@@ -44,6 +44,8 @@ def run(path):
     check("默认开启且基准5秒冷启动", p.enabled and p.start_batch(SID, "u", 100) == 5.0)
     check("默认不低于基准", p.min_interval() == 5.0)
     check("自动上限15/总等待20", p.max_interval() == 15.0 and p.max_batch_wait() == 20.0)
+    check("两个时间配置默认480秒", p.sample_half_life_seconds == 480.0
+          and p.near_miss_ttl_seconds == 480.0)
     check("基准可变且无固定15/30硬顶", policy(mod, base=8).max_interval() == 24.0
           and policy(mod, base=8).max_batch_wait() == 32.0)
 
@@ -61,6 +63,13 @@ def run(path):
     quantiles = [mod.AdaptiveMergePolicy._weighted_quantile(samples, 1000.0, q)[0]
                  for q in (0.60, 0.75, 0.90)]
     check("P60/P75/P90=3/6/8", quantiles == [3.0, 6.0, 8.0], quantiles)
+    aged_samples = [(520.0, 1.0), (1000.0, 9.0)]
+    short_memory = mod.AdaptiveMergePolicy._weighted_quantile(
+        aged_samples, 1000.0, 0.40, 480.0)[0]
+    long_memory = mod.AdaptiveMergePolicy._weighted_quantile(
+        aged_samples, 1000.0, 0.40, 10**9)[0]
+    check("480秒半衰期降低旧样本权重", short_memory == 9.0 and long_memory == 1.0,
+          (short_memory, long_memory))
     responsive = quantile_sample(mod, "responsive")
     balanced = quantile_sample(mod, "balanced")
     merge_first = quantile_sample(mod, "merge_first")
@@ -74,6 +83,19 @@ def run(path):
     p.observe(SID, "u", 10.2)
     window = p.start_batch(SID, "u", 10.2)
     check("near-miss 5秒→6.45秒", math.isclose(window, 6.45), window)
+
+    p = policy(mod, {"adaptive_merge_near_miss_ttl_seconds": 480})
+    p.note_flush(SID, "u", last_message_at=4.0, reason="timeout", now=9.0)
+    p.observe(SID, "u", 10.2)
+    before_expiry = p.start_batch(SID, "u", 490.19)
+    after_expiry = p.start_batch(SID, "u", 490.2)
+    check("near-miss在480秒到点失效并平滑回落",
+          math.isclose(before_expiry, 6.45) and 5.0 < after_expiry < before_expiry,
+          (before_expiry, after_expiry))
+    p = policy(mod, {"adaptive_merge_near_miss_ttl_seconds": 0})
+    p.note_flush(SID, "u", last_message_at=4.0, reason="timeout", now=9.0)
+    p.observe(SID, "u", 10.2)
+    check("有效期0禁用near-miss补偿", p.start_batch(SID, "u", 10.2) == 5.0)
 
     p = policy(mod)
     p.note_flush(SID, "u", last_message_at=4.0, reason="count", now=9.0)

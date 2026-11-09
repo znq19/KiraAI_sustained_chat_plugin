@@ -141,6 +141,21 @@ class DebouncePlugin(BasePlugin):
             value = self.ctx.config["bot_config"].get("bot", {}).get("max_message_interval", 1.5)
         return max(0.1, _safe_float(value, 1.5))
 
+    @property
+    def max_buffer_messages(self) -> int:
+        override = getattr(self, "_max_buffer_messages_override", None)
+        if override is not None:
+            return override
+        value = self.ctx.config.get_config("bot_config.bot.max_buffer_messages", None)
+        if value is None:
+            value = self.ctx.config["bot_config"].get("bot", {}).get("max_buffer_messages", 3)
+        return _safe_int(value, 3)
+
+    @max_buffer_messages.setter
+    def max_buffer_messages(self, value) -> None:
+        # 保留既有测试/外部定制直接赋值；正常路径实时读取 WebUI。
+        self._max_buffer_messages_override = _safe_int(value, 3)
+
     def _merge_base_interval(self) -> float:
         configured = getattr(self, "merge_window_seconds", -1)
         return float(configured) if configured > 0 else self.debounce_interval
@@ -355,7 +370,6 @@ class DebouncePlugin(BasePlugin):
         #   TTL + 上限见 _remember_real_batch（防长时间运行无界增长）。
         self._real_batches: dict[str, float] = {}
         bot_cfg = ctx.config["bot_config"].get("bot", {})
-        self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
         # 消息合并间隔顺延：-1 始终按需读取 WebUI 基准，不保存全局配置快照。
         _basic = cfg.get("section_basic", {}) or {}
         _mws = _basic.get("merge_window_seconds", -1)

@@ -99,6 +99,37 @@ async def run(plugin_dir: Path):
               flushes[0][0] - start)
     await shutdown(plug)
 
+    # max_buffer_messages must update the host and every QueueMerge derived limit.
+    context = ctx(5.0)
+    context.config.values["bot_config.bot.max_buffer_messages"] = 5
+    plug = mod.DebouncePlugin(context, config(10.0, max_unmentioned_messages=5))
+    scheduler = plug.merge_scheduler
+    check("主buffer初始条数上限", plug.max_buffer_messages == 5)
+    check("QueueMerge自动条数读取section_basic",
+          scheduler._short_merge_max_allowed() == 5
+          and scheduler._max_merge_messages_allowed() == 30)
+    context.config.values["bot_config.bot.max_buffer_messages"] = 2
+    check("主buffer与QueueMerge同步调小",
+          plug.max_buffer_messages == 2
+          and scheduler._short_merge_max_allowed() == 2
+          and scheduler._max_merge_messages_allowed() == 21)
+    manual = mod.BatchMergeScheduler(context, {"section_queue_merge": {
+        "max_merge_messages": 9, "short_merge_max_messages": 7}}, {})
+    context.config.values["bot_config.bot.max_buffer_messages"] = 1
+    check("手动正数上限不随全局值变化",
+          manual._max_merge_messages_allowed() == 9
+          and manual._short_merge_max_allowed() == 7)
+    context.config.values["bot_config.bot.max_buffer_messages"] = 5
+    first = await add(plug, context, 15, "one", True)
+    second = await add(plug, context, 16, "two", True)
+    context.config.values["bot_config.bot.max_buffer_messages"] = 2
+    third = await add(plug, context, 17, "three", True)
+    flushed = flushed_msgs(context)
+    check("调小后下一条立即满即推且不裁剪已有消息",
+          len(context.message_processor.flushes) == 1
+          and all(m in flushed for m in (first, second, third)))
+    await shutdown(plug)
+
     # End-to-end near-miss: a real host timeout flush must enlarge the next batch.
     context = ctx(0.2)
     plug = mod.DebouncePlugin(context, config(0.2))

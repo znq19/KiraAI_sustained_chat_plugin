@@ -192,16 +192,19 @@ class BatchMergeScheduler:
         except (TypeError, ValueError):
             self.max_steps = 2
 
-        # -1 自动解析
-        buffer_cap = int(bot_cfg.get("max_buffer_messages", 5))
-        recv_unmentioned = plugin_cfg.get("receive_unmentioned", False)
-        unmentioned_cap = int(plugin_cfg.get("max_unmentioned_messages", 5)) if recv_unmentioned else 0
-        if self.max_merge_messages == -1:
-            # 自动 = (未提及消息缓冲上限 + 最大缓冲消息数) × 3；未提及关闭则不计前者
-            self.max_merge_messages = (unmentioned_cap + buffer_cap) * 3
-        if self.short_merge_max_messages == -1:
-            # 软合并消息数上限默认继承 bot 的 max_buffer_messages
-            self.short_merge_max_messages = buffer_cap
+        # 保留 -1 自动档，实际值在每次合并决策时读取，避免 WebUI 改条数后
+        # 主 buffer 与 QueueMerge 分别使用新旧快照。兼容顶层和 section_basic 配置。
+        self._bot_cfg = dict(bot_cfg or {})
+        basic = plugin_cfg.get("section_basic", {}) or {}
+        if isinstance(basic, dict) and isinstance(basic.get("fields"), dict):
+            basic = basic["fields"]
+        if not isinstance(basic, dict):
+            basic = {}
+        recv_unmentioned = plugin_cfg.get(
+            "receive_unmentioned", basic.get("receive_unmentioned", False))
+        unmentioned_cap = int(plugin_cfg.get(
+            "max_unmentioned_messages", basic.get("max_unmentioned_messages", 5)))
+        self._unmentioned_cap = unmentioned_cap if recv_unmentioned else 0
 
         # per-sid 状态
         self._inflight: dict[str, str] = {}          # sid -> event_id（当前正在处理的批次）
@@ -217,7 +220,26 @@ class BatchMergeScheduler:
         # 有 pending 时立刻唤醒重算截止点，空闲时按 _next_watch_delay 懒睡
         self._tick_wake = asyncio.Event()
 
-    # ================= 动态攒批窗口 =================
+    # ================= 动态攒批窗口与条数上限 =================
+
+    def _buffer_cap(self) -> int:
+        value = self.ctx.config.get_config("bot_config.bot.max_buffer_messages", None)
+        if value is None:
+            value = self._bot_cfg.get("max_buffer_messages", 5)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 5
+
+    def _max_merge_messages_allowed(self) -> int:
+        if self.max_merge_messages == -1:
+            return (self._unmentioned_cap + self._buffer_cap()) * 3
+        return self.max_merge_messages
+
+    def _short_merge_max_allowed(self) -> int:
+        if self.short_merge_max_messages == -1:
+            return self._buffer_cap()
+        return self.short_merge_max_messages
 
     def _uses_dynamic_window(self) -> bool:
         policy = self.adaptive_policy
@@ -414,12 +436,14 @@ class BatchMergeScheduler:
         total_msgs = sum(len(pb.batch.messages) for pb in pending)
         est_tokens = self._estimate_tokens(pending)
         merge_seconds = self._merge_seconds_for(sid)
+        short_merge_max = self._short_merge_max_allowed()
+        max_merge_messages = self._max_merge_messages_allowed()
 
         # 分支① 软合并：小积压提前合并（消息数 <= 软合并上限 且 <= 合并消息数上限 且 token 不超）
-        if (total_msgs <= self.short_merge_max_messages
-                and total_msgs <= self.max_merge_messages
+        if (total_msgs <= short_merge_max
+                and total_msgs <= max_merge_messages
                 and (self.max_merge_est_tokens == 0 or est_tokens <= self.max_merge_est_tokens)):
-            self._log(sid, f"软合并：{len(pending)}批次/{total_msgs}条（≤软合并上限{self.short_merge_max_messages}）")
+            self._log(sid, f"软合并：{len(pending)}批次/{total_msgs}条（≤软合并上限{short_merge_max}）")
             to_merge, rest = self._split_by_limits(pending)
         # 分支② 超时合并：攒批到点合并（无论消息多少，超限拆批）
         elif time.time() - pending[0].arrival_ts >= merge_seconds:
@@ -503,6 +527,7 @@ class BatchMergeScheduler:
         total_msgs = 0
         total_tokens = 0
         media_batches = 0
+        max_merge_messages = self._max_merge_messages_allowed()
         for pb in pending:
             msgs = len(pb.batch.messages)
             toks = self._estimate_tokens([pb])
@@ -514,7 +539,7 @@ class BatchMergeScheduler:
                     and has_media and media_batches >= self.media_preprocess_max_batches):
                 rest.append(pb)
                 continue
-            if self.max_merge_messages and total_msgs + msgs > self.max_merge_messages:
+            if max_merge_messages and total_msgs + msgs > max_merge_messages:
                 rest.append(pb)
                 continue
             if self.max_merge_est_tokens and total_tokens + toks > self.max_merge_est_tokens:

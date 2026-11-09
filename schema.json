@@ -69,6 +69,20 @@
         "minimum": 0,
         "hint": "仅允许低于基准时生效；0=自动为基准50%，正数=最低窗口，实际不高于基准值"
       },
+      "adaptive_merge_sample_half_life_seconds": {
+        "type": "float",
+        "name": "学习样本半衰期（秒）",
+        "default": 480,
+        "minimum": 1,
+        "hint": "历史发言间隔每经过该秒数权重减半；越小越追随近期节奏，越大越重视历史"
+      },
+      "adaptive_merge_near_miss_ttl_seconds": {
+        "type": "float",
+        "name": "近失补偿有效期（秒）",
+        "default": 480,
+        "minimum": 0,
+        "hint": "上次刚推送就补充所产生的临时放大窗口有效期，过期后逐批回落；0=禁用该补偿"
+      },
       "group_chat_prompt": {
         "name": "群聊额外提示词",
         "type": "markdown",
