@@ -27,7 +27,47 @@
         "type": "float",
         "name": "消息合并间隔顺延（秒）",
         "default": -1,
-        "hint": "消息合并间隔顺延（buffer 防抖重置）：最后一条消息到达后 N 秒无新消息才 flush 成批次送 LLM，期间新消息到达重置倒计时。-1=自动取 WebUI 设置值并启用顺延；0=不启用顺延（按 WebUI 固定间隔）；>0=自定义秒数。不会无限等待：框架最大缓冲消息（max_buffer_messages）会兜底"
+        "hint": "-1=取 WebUI 消息合并时间作为基准；0=不启用主消息顺延；正数=自定义基准。开启动态合并后，该值是初始值和调节中心，不再是每批固定等待"
+      },
+      "adaptive_merge_enabled": {
+        "type": "switch",
+        "name": "动态消息合并",
+        "default": true,
+        "hint": "默认开启。按近期同用户发言间隔调整合并窗口；持续/守望消息批、通知与队列自动攒批同步跟随"
+      },
+      "adaptive_merge_mode": {
+        "type": "string",
+        "name": "动态合并倾向",
+        "options": ["responsive", "balanced", "merge_first"],
+        "default": "balanced",
+        "hint": "responsive=P60（响应优先）、balanced=P75（均衡）、merge_first=P90（合并优先）；高分位通常合并更多但等待更久"
+      },
+      "adaptive_merge_max_seconds": {
+        "type": "float",
+        "name": "动态窗口上限（秒）",
+        "default": 0,
+        "minimum": 0,
+        "hint": "0=自动为基准值3倍；正数=自定义上限，实际不低于基准值"
+      },
+      "adaptive_merge_max_batch_wait": {
+        "type": "float",
+        "name": "单批最长等待（秒）",
+        "default": 0,
+        "minimum": 0,
+        "hint": "0=自动为基准值4倍；正数=自定义，实际不低于动态窗口上限。防止持续发言无限顺延"
+      },
+      "adaptive_merge_allow_below_base": {
+        "type": "switch",
+        "name": "允许低于基准值",
+        "default": false,
+        "hint": "默认关闭：窗口可回落到基准但不低于基准；开启后才允许低于基准"
+      },
+      "adaptive_merge_min_seconds": {
+        "type": "float",
+        "name": "最低动态窗口（秒）",
+        "default": 0,
+        "minimum": 0,
+        "hint": "仅允许低于基准时生效；0=自动为基准50%，正数=最低窗口，实际不高于基准值"
       },
       "group_chat_prompt": {
         "name": "群聊额外提示词",
@@ -59,7 +99,7 @@
         "type": "switch",
         "name": "禁言静默感知（QQ增强）",
         "default": false,
-        "hint": "默认关 = 完全旧行为。开启后：解析 QQ增强的 [System …禁言了你N秒] / 解除禁言 notice；禁言期间暂停群持续/空停守望/私聊主动，且不武装守望；没收到 notice 时用发送失败（result.ok=False + 禁言/发言频率/1200）兜底静默 60s。解除通知提前清除。"
+        "hint": "默认关闭。禁言期间暂停群持续、空停守望和私聊主动；支持解除通知及发送失败兜底（60秒）"
       },
       "enable_manage_ignore": {
         "type": "switch",
@@ -753,7 +793,7 @@
         "name": "超时合并(秒)",
         "type": "float",
         "default": 0,
-        "hint": "积压批次攒批达到该时长即合并推送（无论消息多少）；0=不攒批：当前批次一完成，积压批次全部合并推送，分批仅由下方各上限（批次数/消息数/token）控制。若要设置时间，建议值不超过所用 LLM 单次回复平均耗时的一半（如 LLM 回复通常需 10 秒，可设 5 秒）"
+        "hint": "0=自动：动态合并开启时跟随当前窗口，关闭时保持旧的立即合并；正数=手动固定攒批时间。动态到点不会打断仍在处理的批次"
       },
       "max_merge_batches_limit": {
         "name": "单次最大合并批次数",

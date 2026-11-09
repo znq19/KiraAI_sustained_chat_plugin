@@ -143,6 +143,8 @@ class BatchMergeScheduler:
         sec = plugin_cfg.get("section_queue_merge", {})
         self.enabled = sec.get("enabled", True)
         self.max_merge_seconds = float(sec.get("max_merge_seconds", 0))
+        # 宿主可选注入 AdaptiveMergePolicy；0 自动档才跟随，正数始终是手动覆盖。
+        self.adaptive_policy = None
         self.max_merge_batches_limit = int(sec.get("max_merge_batches_limit", 0))
         self.max_merge_messages = int(sec.get("max_merge_messages", -1))
         self.max_merge_est_tokens = int(sec.get("max_merge_est_tokens", 0))
@@ -214,6 +216,19 @@ class BatchMergeScheduler:
         # 兜底节拍的唤醒信号（见 _ensure_task_locked / _tick_loop）：
         # 有 pending 时立刻唤醒重算截止点，空闲时按 _next_watch_delay 懒睡
         self._tick_wake = asyncio.Event()
+
+    # ================= 动态攒批窗口 =================
+
+    def _uses_dynamic_window(self) -> bool:
+        policy = self.adaptive_policy
+        return self.max_merge_seconds <= 0 and policy is not None and bool(policy.enabled)
+
+    def _merge_seconds_for(self, sid: str) -> float:
+        if self.max_merge_seconds > 0:
+            return self.max_merge_seconds
+        if self._uses_dynamic_window():
+            return max(0.1, float(self.adaptive_policy.current_window(sid)))
+        return 0.0
 
     # ================= 调试日志 =================
 
@@ -398,6 +413,7 @@ class BatchMergeScheduler:
 
         total_msgs = sum(len(pb.batch.messages) for pb in pending)
         est_tokens = self._estimate_tokens(pending)
+        merge_seconds = self._merge_seconds_for(sid)
 
         # 分支① 软合并：小积压提前合并（消息数 <= 软合并上限 且 <= 合并消息数上限 且 token 不超）
         if (total_msgs <= self.short_merge_max_messages
@@ -406,10 +422,16 @@ class BatchMergeScheduler:
             self._log(sid, f"软合并：{len(pending)}批次/{total_msgs}条（≤软合并上限{self.short_merge_max_messages}）")
             to_merge, rest = self._split_by_limits(pending)
         # 分支② 超时合并：攒批到点合并（无论消息多少，超限拆批）
-        elif time.time() - pending[0].arrival_ts >= self.max_merge_seconds:
+        elif time.time() - pending[0].arrival_ts >= merge_seconds:
             waited = time.time() - pending[0].arrival_ts
-            self._log(sid, f"超时合并：攒批 {waited:.1f}s ≥ {self.max_merge_seconds}s，{len(pending)}批次/{total_msgs}条")
+            self._log(sid, f"超时合并：攒批 {waited:.1f}s ≥ {merge_seconds:.2f}s，{len(pending)}批次/{total_msgs}条")
             to_merge, rest = self._split_by_limits(pending)
+        # 动态自动档：未到窗口且不满足软合并时，整组 pending 继续等待；
+        # 不走旧的“先单推第一批”分支，否则动态攒批窗口形同虚设。
+        elif self._uses_dynamic_window() and time.time() - pending[0].arrival_ts < merge_seconds:
+            self._pending[sid] = pending
+            self._log(sid, f"动态攒批等待：{len(pending)}批次/{total_msgs}条，窗口 {merge_seconds:.2f}s")
+            return None
         # 分支③ 独立推送：只推第一个批次（1:1），其余留 pending 等下一轮
         else:
             self._log(sid, f"独立推送：第1个批次（{len(pending[0].batch.messages)}条），其余 {len(pending) - 1} 个留 pending")
@@ -612,8 +634,9 @@ class BatchMergeScheduler:
                 candidates.append(
                     self.inflight_stall_timeout - (now - self._inflight_since.get(sid, now))
                 )
-            if self.max_merge_seconds > 0:
-                candidates.append(self.max_merge_seconds - (now - pending[0].arrival_ts))
+            merge_seconds = self._merge_seconds_for(sid)
+            if merge_seconds > 0:
+                candidates.append(merge_seconds - (now - pending[0].arrival_ts))
             if candidates:
                 delay = min(delay, max(self.STOPPED_RECHECK_INTERVAL, min(candidates)))
         return delay
@@ -668,8 +691,10 @@ class BatchMergeScheduler:
                         and now - self._inflight_since.get(sid, now) >= self.inflight_stall_timeout
                     )
                     if not stalled:
-                        # 攒批超时（max_merge_seconds>0 且到点）时，即使 in-flight 未收尾也强制推送
-                        if self.max_merge_seconds > 0 and now - pending[0].arrival_ts >= self.max_merge_seconds:
+                        # 只有用户显式设置的固定正数保留旧的“在飞也强制推送”语义。
+                        # 动态自动窗口到点仅表示 merge-ready，绝不制造并发 LLM 批次。
+                        if (not self._uses_dynamic_window() and self.max_merge_seconds > 0
+                                and now - pending[0].arrival_ts >= self.max_merge_seconds):
                             self._log(sid, f"超时兜底：in-flight 未收尾且攒批到点，强制推送 pending")
                         else:
                             continue

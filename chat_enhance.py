@@ -716,9 +716,10 @@ class NoticeMerger:
     兜底统一 publish。
     """
 
-    def __init__(self, plugin, merge_seconds: float = 1.5):
+    def __init__(self, plugin, merge_seconds=1.5):
         self._plugin = plugin
-        self._merge_seconds = max(0.5, merge_seconds)
+        # 可传入 per-sid provider；每次兜底任务开始时读当前值，不缓存全局快照。
+        self._merge_seconds = merge_seconds
         self._pending: dict[str, list] = defaultdict(list)
         self._flush_tasks: dict[str, asyncio.Task] = {}
         self._publish_tasks: set = set()
@@ -733,10 +734,17 @@ class NoticeMerger:
                 self._flush_tasks.pop(sid, None)
                 self.flush(sid)
 
+    def _window(self, sid: str) -> float:
+        try:
+            value = self._merge_seconds(sid) if callable(self._merge_seconds) else self._merge_seconds
+            return max(0.1, float(value))
+        except Exception:
+            return 1.5
+
     async def _flush_later(self, sid: str) -> None:
         try:
             try:
-                await asyncio.sleep(self._merge_seconds)
+                await asyncio.sleep(self._window(sid))
             except asyncio.CancelledError:
                 return
             self.flush(sid)
