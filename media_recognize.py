@@ -2100,6 +2100,14 @@ class ParallelMediaRecognizer:
         except Exception:
             return Path("data") / "plugins_media_cache"
 
+    def _is_stable_media_path(self, path) -> bool:
+        try:
+            target = Path(path).resolve()
+            target.relative_to(self._media_cache_dir().resolve())
+            return True
+        except Exception:
+            return False
+
     async def _persist_access_media(self, elem):
         """Forward/历史恢复专用：URL、path、base64、data_url 都可落盘。"""
         return await self._persist_media(elem, allow_non_url=True)
@@ -2125,13 +2133,19 @@ class ParallelMediaRecognizer:
             if file_type not in ("url", "path", "base64", "data_url"):
                 return None, None
             old = getattr(elem, "_temp_path", None)
-            if old and os.path.exists(old):
+            old_exists = bool(old and os.path.exists(old))
+            if old_exists and (not allow_non_url or self._is_stable_media_path(old)):
                 try:
                     self.access.note_media_path(elem, old)
                 except Exception:
                     pass
                 return old, md5
-            b64 = await asyncio.wait_for(elem.to_base64(), timeout=self.download_timeout)
+            if old_exists:
+                # 恢复专用：临时目录中的已有字节只读盘复制，不重新下载 URL。
+                b64 = await asyncio.to_thread(
+                    lambda: base64.b64encode(Path(old).read_bytes()).decode())
+            else:
+                b64 = await asyncio.wait_for(elem.to_base64(), timeout=self.download_timeout)
             if not b64:
                 return None, None
             if b64.startswith("data:"):
@@ -2141,14 +2155,6 @@ class ParallelMediaRecognizer:
             if not data:
                 return None, None
             md5v = md5 or hashlib.md5(data).hexdigest()
-            # guard 已知媒体登记：字节已在手，图片/表情顺手算 dHash（同图重压缩副本
-            # 也能被 guard 识别为已知媒体）；失败静默，不影响落盘主流程
-            try:
-                _ph = None
-                if elem.__class__.__name__ in ("Image", "Sticker"):
-                    _ph = await asyncio.to_thread(self._phash_of_bytes, data)
-            except Exception:
-                pass
             ext = ""
             try:
                 mime = (getattr(elem, "mime", None) or "").split(";")[0].strip()

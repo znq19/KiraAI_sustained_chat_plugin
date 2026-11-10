@@ -3509,7 +3509,7 @@ class DebouncePlugin(BasePlugin):
     # ========== 按需媒体 / Forward 工具 ==========
     @register.tool(
         name="read_media",
-        description="按需读取图片、动画表情或语音；仅在原始消息出现 [Image/Sticker/Record #完整ID: 可读取] 且需要内容时调用。ID 是 # 后、冒号前的完整字符串，必须逐字复制（含 i/s/r 前缀），不要删除前缀、猜测或从摘要、文件名、message_id 构造。",
+        description="读取图片、动画表情或语音；仅在原始消息含 [Image/Sticker/Record #ID: 可读取] 且需要内容时调用。media_ids 逐字复制 # 后的完整 ID（含 i/s/r 前缀），不得删前缀或猜测。",
         params={"type": "object", "properties": {"media_ids": {
             "type": "array", "maxItems": 16, "uniqueItems": True,
             "items": {"type": "string", "pattern": "^[isr][0-9a-f]{8,64}$", "minLength": 9, "maxLength": 65},
@@ -3521,7 +3521,7 @@ class DebouncePlugin(BasePlugin):
 
     @register.tool(
         name="read_forward",
-        description="按需展开原始消息中的合并聊天记录；forward_id/forward_ids 至少传一个。ID 必须逐字复制并包含 f 前缀。depth=1 看当前层，N 向下 N 层，-1 读取允许范围内全部；分页传上次返回的 cursor。",
+        description="展开原始消息中的合并记录；forward_id/forward_ids 至少传一个，逐字复制含 f 前缀的完整 ID。depth=1 当前层，N 向下 N 层，-1 允许范围内全部；cursor 使用上次返回值。",
         params={"type": "object", "properties": {
             "forward_id": {"type": "string", "pattern": "^f[0-9a-f]{8,64}$",
                            "minLength": 9, "maxLength": 65,
@@ -3547,13 +3547,14 @@ class DebouncePlugin(BasePlugin):
             self._filter_tools(req.tool_set, ["read_media"], "exact")
         if not access.forward_tool_enabled:
             self._filter_tools(req.tool_set, ["read_forward"], "exact")
-        hints = []
+        tool_names = []
         if access.image_tool_enabled or access.audio_tool_enabled:
-            hints.append("原始消息中的可读取媒体用 read_media；ID 是 # 后、冒号前的完整字符串，必须逐字复制，不得删除 i/s/r 等任何前缀或猜测。")
+            tool_names.append("read_media")
         if access.forward_tool_enabled:
-            hints.append("原始消息中的 [Forward #完整ID: ...] 可用 read_forward 展开；逐字复制含 f 前缀的完整 ID；depth=-1 可读允许范围内全部剩余层。")
-        if not hints:
+            tool_names.append("read_forward")
+        if not tool_names:
             return
+        hints = ["/".join(tool_names) + " 的 ID 须逐字复制完整值，不得删前缀或猜测。"]
         for p in req.system_prompt:
             if getattr(p, "name", "") == "chat_env" and not getattr(p, "_media_access_hint_added", False):
                 p.content = (p.content or "") + "\n" + "\n".join(hints)

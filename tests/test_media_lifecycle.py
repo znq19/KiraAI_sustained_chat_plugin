@@ -96,6 +96,27 @@ async def run(plugin_dir: Path):
     check("完整旧ID仍可读取", "识别成功" in right.text and "file_path:" in right.text,
           right.text)
 
+    manager._reading_start(old_id)  # 模拟另一个仍在进行的并发读取
+    original_read = manager.recognizer.read_access_entry
+    async def fail_read(entry, evt):
+        raise RuntimeError("forced")
+    manager.recognizer.read_access_entry = fail_read
+    failed = await manager.read_media(gif_evt, [old_id])
+    check("识别异常只释放一次在飞计数", "read_failed" in failed.text
+          and manager._reading_ids.get(old_id) == 1, manager._reading_ids)
+    manager._reading_stop(old_id)
+    manager.recognizer.read_access_entry = original_read
+
+    # 模拟 Python id(message) 被新对象复用：两个旧索引都必须先清空。
+    reused_mid = id(gif_msg)
+    manager._message_refs[reused_mid] = lambda: object()
+    manager._message_entries[reused_mid] = ["i00000000"]
+    manager._message_forwards[reused_mid] = ["f00000000"]
+    manager.prepare_message(gif_msg, sid)
+    check("消息对象ID复用不会拼接旧媒体或Forward索引",
+          manager._message_entries[reused_mid] == [old_id]
+          and manager._message_forwards[reused_mid] == [])
+
     new_msg = message("new-message", MessageChain([Image("base64://bmV3")]))
     manager.prepare_message(new_msg, sid)
     new_id = new_msg.chain[0]._media_access_id
@@ -128,6 +149,19 @@ async def run(plugin_dir: Path):
     check("重启并交换顺序后扩展ID不漂移", r2.chain[0]._media_access_id == id2
           and r1.chain[0]._media_access_id == id1)
     check("身份索引同时保留两条碰撞条目", len(restored._catalog) == 2)
+    await drain(restored)
+    await collision._save_catalog_snapshot()
+    snapshot = make_manager(module, collision_tmp)
+    original_snapshot_read = snapshot._read_json_sync
+    def snapshot_only(path):
+        if path.parent == collision_tmp / "entries":
+            raise AssertionError("unchanged snapshot fell back to per-entry reads")
+        return original_snapshot_read(path)
+    snapshot._read_json_sync = snapshot_only
+    await snapshot.initialize()
+    check("目录未变时快照启动不逐条读取JSON", len(snapshot._catalog) == 2
+          and snapshot._identity_ids[("i", d2)] == id2)
+    await snapshot.shutdown()
 
     # Session isolation for media and Forward.
     other_evt = event([], group=True)
@@ -237,10 +271,43 @@ async def run(plugin_dir: Path):
     )
     check("相同内容并发落盘无临时文件竞态", not list(real_cache.glob("*.tmp"))
           and len(list(real_cache.glob("*"))) == 2)
+
+    scheduled = 0
+    original_schedule = real_manager._schedule_task
+    def count_schedule(coro):
+        nonlocal scheduled
+        scheduled += 1
+        return original_schedule(coro)
+    real_manager._schedule_task = count_schedule
+    one_msg = message("one-write", MessageChain([LocalImage(payload, "base64")]))
+    real_manager.prepare_message(one_msg, sid)
+    await drain(real_manager)
+    real_manager._schedule_task = original_schedule
+    check("单个媒体落盘合并为一次目录任务", scheduled == 1
+          and not real_manager._persisting_ids, scheduled)
+
+    class TempImage(LocalImage):
+        async def to_base64(self):
+            raise AssertionError("network/download path was used")
+    external = real_tmp / "external-temp.jpg"
+    external.write_bytes(b"temp-image")
+    temp_image = TempImage("https://invalid.example/image", "url")
+    temp_image._temp_path = str(external)
+    real_manager.prefetch_enabled = False
+    temp_msg = message("temp-stable", MessageChain([temp_image]))
+    real_manager.prepare_message(temp_msg, sid)
+    temp_id = temp_image._media_access_id
+    await drain(real_manager)
+    stable_copy = Path(real_manager._entries[temp_id]["cache_path"])
+    check("纯按需将已有临时字节本地复制到稳定缓存", real._is_stable_media_path(stable_copy)
+          and stable_copy.read_bytes() == b"temp-image")
+    external.unlink()
     real_restored = make_manager(module, real_tmp, Recognizer())
     real_result = await real_restored.read_media(evt, real_ids)
     check("三种非URL嵌套媒体重启后均可恢复", real_result.text.count("识别成功") == 3,
           real_result.text)
+    temp_result = await real_restored.read_media(evt, [temp_id])
+    check("临时源删除后稳定缓存仍可读", "识别成功" in temp_result.text, temp_result.text)
     await real_manager.shutdown()
     await real_restored.shutdown()
 
@@ -253,6 +320,9 @@ async def run(plugin_dir: Path):
           and len(manager.recognizer.calls) == calls_before + 1)
     bad_cursor = await manager.read_forward(evt, forward_id=fwd_id, cursor="not-a-cursor")
     check("非法cursor明确报错", "invalid_cursor" in bad_cursor.text)
+    foreign_cursor = await manager.read_forward(
+        evt, forward_id=fwd_id, cursor=json.dumps({"f00000000": "0"}))
+    check("游标不能混入其他Forward ID", "invalid_cursor" in foreign_cursor.text)
 
     # Runtime-only message IDs and genuine source expiry are reported precisely.
     volatile_tmp = Path(tempfile.mkdtemp(prefix="kira-media-volatile-"))
