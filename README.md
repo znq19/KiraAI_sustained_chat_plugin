@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.0
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.1
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -377,6 +377,16 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.8.1
+
+- **媒体 ID 缩短并消除前缀歧义**：新媒体/Forward 默认使用类型前缀 + 8 位 hex；完整哈希与身份索引持久化，前 8 位碰撞时逐两位扩展，绝不覆盖已有条目。旧 12 位 ID 继续可读，重启和重复投递后扩展 ID 不漂移。工具说明要求逐字复制 `#` 后的完整 ID，避免把开头的 `id` 误当标签删除。
+- **错误分类与自纠**：`invalid_id`、`not_found`、`source_unavailable`、`batch_limit`、`invalid_cursor` 等状态明确分离，不再把一切查不到都报成“媒体过期”。格式错误和未知 ID 可附当前批次最多 8 个合法候选，仅供模型核对，不自动选择或读取。
+- **会话与批量安全**：媒体和 Forward 强制校验会话归属，跨会话统一 `not_found`；媒体去重后每次最多 16 个、Forward 最多 8 个，超限在执行识别前整体拒绝。非法 cursor 不再静默回到第一页。
+- **重启恢复修正**：顶层已知路径也写入目录；新增独立 `history_occurrence`，修复 Forward 后顶层媒体的历史序号错位；嵌套 URL/base64/data_url/path 均可真实写入内容哈希缓存。轻量 Forward 树先落盘，再异步补媒体路径。临时目录已有字节仅本地复制到稳定内容缓存，纯按需不触发额外网络下载；目录回写任务去重。
+- **生命周期治理**：运行时媒体/Forward 热条目有界，消息改弱引用并校验对象身份，避免 Python `id(message)` 复用串入旧索引；轻量目录按每会话 2048、全局 16384 条及核心历史年龄清理，并使用原子快照与目录 mtime 做启动增量校验，近期与并发读取条目受保护。删除会话只清理其目录，不直接删除可能被其他会话共享的媒体字节；shutdown 最多等待 3 秒完成目录落盘。
+- **兼容与缓存**：不改变原生 `media_refs`、预取/自动呈现、并行读取和 `file_path` 语义；不向 system prompt 动态注入 ID，工具 schema 保持稳定。新增截图精确回归、强制碰撞、跨会话、真实三类型恢复、LRU/会话删除/关闭等 43 项专项测试。
+- 版本 2.8.0 → 2.8.1
 
 ### v2.8.0
 

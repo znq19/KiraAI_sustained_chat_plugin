@@ -12,6 +12,8 @@ import json
 import os
 import re
 import time
+import weakref
+from collections import OrderedDict
 from pathlib import Path
 
 from core.chat.message_elements import Text, Image, Sticker, Record, Reply, Forward
@@ -42,7 +44,23 @@ except ImportError:
     store_session_media = None
 
 
+MEDIA_ID_RE = re.compile(r"^[isr][0-9a-f]{8,64}$")
+FORWARD_ID_RE = re.compile(r"^f[0-9a-f]{8,64}$")
+MEDIA_ID_PATTERN = r"^[isr][0-9a-f]{8,64}$"
+FORWARD_ID_PATTERN = r"^f[0-9a-f]{8,64}$"
+
+
 class MediaAccessManager:
+    SHORT_ID_LEN = 8
+    MAX_BATCH_MEDIA = 16
+    MAX_BATCH_FORWARDS = 8
+    RUNTIME_LIMIT = 2048
+    MESSAGE_INDEX_LIMIT = 256
+    MESSAGE_PIN_LIMIT = 32
+    CATALOG_SESSION_LIMIT = 2048
+    CATALOG_TOTAL_LIMIT = 16384
+    CATALOG_CLEANUP_INTERVAL = 60.0
+
     def __init__(self, ctx, recognizer, plugin_cfg: dict, plugin_id: str):
         self.ctx = ctx
         self.recognizer = recognizer
@@ -65,13 +83,31 @@ class MediaAccessManager:
             self.forward_max_depth = max(1, int(basic.get("forward_max_depth", 4)))
         except (TypeError, ValueError):
             self.forward_max_depth = 4
-        self._entries: dict[str, dict] = {}
-        self._forwards: dict[str, dict] = {}
-        self._message_entries: dict[int, list[str]] = {}
+        self._entries = OrderedDict()
+        self._forwards = OrderedDict()
+        self._message_entries = OrderedDict()
+        self._message_forwards = OrderedDict()
+        self._message_refs = OrderedDict()
+        # 轻量身份索引覆盖整个磁盘目录；热条目才有界进入运行时 LRU。
+        self._catalog: dict[str, dict] = {}
+        self._identity_ids: dict[tuple[str, str], str] = {}
         self._bg_tasks: set[asyncio.Task] = set()
+        self._reading_ids: dict[str, int] = {}
+        self._persisting_ids: set[str] = set()
+        self._initialized = False
+        self._last_catalog_cleanup = 0.0
+        self._session_event_bus = None
         root = get_data_path() / "plugin_data" / plugin_id / "media_access"
         self._entry_dir = root / "entries"
         self._forward_dir = root / "forwards"
+        self._index_path = root / "identity_index.json"
+        self._catalog_max_age_seconds = 0
+        try:
+            cleanup = ctx.config.get_config("bot_config.message_history_cleanup", {}) or {}
+            if cleanup.get("enabled", True):
+                self._catalog_max_age_seconds = max(0, int(cleanup.get("max_age_days", 0))) * 86400
+        except Exception:
+            pass
 
     @property
     def any_enabled(self) -> bool:
@@ -79,7 +115,206 @@ class MediaAccessManager:
 
     @staticmethod
     def _digest(*parts) -> str:
-        return hashlib.sha256("\x1f".join(map(str, parts)).encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha256("\x1f".join(map(str, parts)).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _message_ref(message):
+        try:
+            return weakref.ref(message)
+        except TypeError:
+            return lambda: message
+
+    @staticmethod
+    def _message_of(record):
+        ref = record.get("message_ref")
+        return ref() if ref is not None else None
+
+    @staticmethod
+    def _entry_digest(entry):
+        digest = entry.get("digest")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            return digest
+        if entry.get("kind") in ("Image", "Sticker", "Record"):
+            return MediaAccessManager._digest(
+                entry.get("sid"), entry.get("message_id"), entry["kind"],
+                entry.get("occurrence", 0))
+        return ""
+
+    def _load_catalog_sync(self):
+        snapshot = {}
+        snapshot_dirs = {}
+        try:
+            raw = self._read_json_sync(self._index_path)
+            snapshot_dirs = raw.get("directories", {}) or {}
+            if raw.get("version") == 1 and isinstance(raw.get("items"), list):
+                for item in raw["items"]:
+                    kind, key = item.get("kind"), item.get("id")
+                    pattern = MEDIA_ID_RE if kind == "media" else FORWARD_ID_RE
+                    if isinstance(key, str) and pattern.fullmatch(key):
+                        snapshot[(kind, key)] = item
+        except (OSError, ValueError, TypeError, AttributeError):
+            snapshot = {}
+            snapshot_dirs = {}
+        result = []
+        for kind, directory in (("media", self._entry_dir), ("forward", self._forward_dir)):
+            if not directory.is_dir():
+                continue
+            pattern = MEDIA_ID_RE if kind == "media" else FORWARD_ID_RE
+            paths = list(directory.glob("*.json"))
+            snapshot_keys = {key for snapshot_kind, key in snapshot if snapshot_kind == kind}
+            current_keys = {path.stem for path in paths if pattern.fullmatch(path.stem)}
+            directory_meta = snapshot_dirs.get(kind) or {}
+            if (directory_meta and directory.stat().st_mtime == directory_meta.get("mtime")
+                    and current_keys == snapshot_keys):
+                # 原子写 + 目录 mtime + 文件名集合三重校验，兼容不同文件系统时间粒度。
+                for (snapshot_kind, key), cached in snapshot.items():
+                    if snapshot_kind != kind:
+                        continue
+                    file_mtime = cached.get("file_mtime", cached.get("mtime", 0))
+                    result.append((kind, key, cached.get("sid"), cached.get("digest", ""),
+                                   cached.get("mtime", file_mtime), None,
+                                   cached.get("cache_path"), file_mtime))
+                continue
+            for path in paths:
+                key = path.stem
+                if not pattern.fullmatch(key):
+                    continue
+                try:
+                    file_mtime = path.stat().st_mtime
+                    cached = snapshot.get((kind, key))
+                    if cached is not None and cached.get("file_mtime") == file_mtime:
+                        result.append((kind, key, cached.get("sid"), cached.get("digest", ""),
+                                       cached.get("mtime", file_mtime), None,
+                                       cached.get("cache_path"), file_mtime))
+                        continue
+                    data = self._read_json_sync(path)
+                    if data.get("id") != key:
+                        continue
+                    digest = self._entry_digest(data)
+                    result.append((kind, key, data.get("sid"), digest,
+                                   file_mtime, data, data.get("cache_path"), file_mtime))
+                except (OSError, ValueError, TypeError):
+                    continue
+        return result
+
+    def _write_catalog_snapshot_sync(self, payload):
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        directories = {}
+        for kind, directory in (("media", self._entry_dir), ("forward", self._forward_dir)):
+            try:
+                directories[kind] = {"mtime": directory.stat().st_mtime}
+            except OSError:
+                pass
+        payload["directories"] = directories
+        self._atomic_json(self._index_path, payload)
+
+    async def _save_catalog_snapshot(self):
+        items = []
+        for key, meta in self._catalog.items():
+            if meta.get("file_mtime") is None:
+                continue
+            items.append({
+                "id": key, "kind": meta.get("kind"), "sid": meta.get("sid"),
+                "digest": meta.get("digest", ""), "mtime": meta.get("mtime", 0),
+                "cache_path": meta.get("cache_path"), "file_mtime": meta["file_mtime"],
+            })
+        await asyncio.to_thread(self._write_catalog_snapshot_sync, {"version": 1, "items": items})
+
+    async def initialize(self):
+        """Load only identities at startup; heavy entries remain lazy and bounded."""
+        if self._initialized:
+            return
+        rows = await asyncio.to_thread(self._load_catalog_sync)
+        rows.sort(key=lambda row: row[4])
+        for kind, key, sid, digest, mtime, _data, cache_path, file_mtime in rows:
+            self._catalog[key] = {"kind": kind, "sid": sid, "digest": digest,
+                                  "mtime": mtime, "cache_path": cache_path,
+                                  "file_mtime": file_mtime}
+            if digest:
+                self._identity_ids[(key[0], digest)] = key
+        self._initialized = True
+        try:
+            bus = getattr(self.ctx, "event_bus", None)
+            if bus is not None:
+                bus.subscribe("session_deleted", self._on_session_deleted)
+                self._session_event_bus = bus
+        except Exception:
+            self._session_event_bus = None
+
+    def _allocate_id(self, prefix, digest, sid, kind):
+        existing = self._identity_ids.get((prefix, digest))
+        if existing:
+            return existing
+        for length in range(self.SHORT_ID_LEN, 65, 2):
+            key = prefix + digest[:length]
+            other = self._catalog.get(key)
+            if other is None:
+                self._catalog[key] = {
+                    "kind": kind, "sid": sid, "digest": digest, "mtime": time.time(),
+                }
+                self._identity_ids[(prefix, digest)] = key
+                return key
+            if other.get("digest") == digest:
+                self._identity_ids[(prefix, digest)] = key
+                return key
+        raise RuntimeError("unable to allocate a unique media access ID")
+
+    def _protected_message_ids(self):
+        protected = set()
+        if self.MESSAGE_PIN_LIMIT <= 0:
+            return protected
+        for mapping in (self._message_entries, self._message_forwards):
+            for _mid, ids in list(mapping.items())[-self.MESSAGE_PIN_LIMIT:]:
+                protected.update(ids)
+        return protected
+
+    def _reading_start(self, key):
+        self._reading_ids[key] = self._reading_ids.get(key, 0) + 1
+
+    def _reading_stop(self, key):
+        count = self._reading_ids.get(key, 0) - 1
+        if count > 0:
+            self._reading_ids[key] = count
+        else:
+            self._reading_ids.pop(key, None)
+
+    def _trim_runtime(self):
+        protected = self._protected_message_ids() | set(self._reading_ids)
+        for mapping in (self._entries, self._forwards):
+            while len(mapping) > self.RUNTIME_LIMIT:
+                for key in mapping:
+                    if key not in protected:
+                        mapping.pop(key, None)
+                        break
+                else:
+                    break
+        while len(self._message_entries) > self.MESSAGE_INDEX_LIMIT:
+            self._message_entries.popitem(last=False)
+        while len(self._message_forwards) > self.MESSAGE_INDEX_LIMIT:
+            self._message_forwards.popitem(last=False)
+        while len(self._message_refs) > self.MESSAGE_INDEX_LIMIT:
+            mid, _ref = self._message_refs.popitem(last=False)
+            self._message_entries.pop(mid, None)
+            self._message_forwards.pop(mid, None)
+
+    def _bind_message(self, message):
+        """Prevent stale id(message) entries from joining a recycled object identity."""
+        mid = id(message)
+        ref = self._message_refs.get(mid)
+        if ref is None or ref() is not message:
+            self._message_entries[mid] = []
+            self._message_forwards[mid] = []
+            self._message_refs[mid] = self._message_ref(message)
+        self._message_refs.move_to_end(mid)
+
+    def _index_message(self, mapping, message, key):
+        self._bind_message(message)
+        mid = id(message)
+        ids = mapping.setdefault(mid, [])
+        if key not in ids:
+            ids.append(key)
+        mapping.move_to_end(mid)
+        self._trim_runtime()
 
     @staticmethod
     def _is_visual(kind: str) -> bool:
@@ -93,34 +328,40 @@ class MediaAccessManager:
         return True if not self._enabled_for(kind) else self.prefetch_enabled
 
     def _register_media(self, elem, kind: str, sid: str, message,
-                        occurrence: int, nested: bool) -> str:
-        message_id = getattr(message, "message_id", None) or f"runtime-{id(message)}"
+                        occurrence: int, nested: bool, history_occurrence=None) -> str:
+        raw_message_id = getattr(message, "message_id", None)
+        message_id = raw_message_id or f"runtime-{id(message)}"
         prefix = {"Image": "i", "Sticker": "s", "Record": "r"}[kind]
-        media_id = prefix + self._digest(sid, message_id, kind, occurrence)
+        digest = self._digest(sid, message_id, kind, occurrence)
+        media_id = self._allocate_id(prefix, digest, sid, "media")
         entry = self._entries.get(media_id)
         if entry is None:
             entry = {
-                "id": media_id, "kind": kind, "sid": sid,
+                "id": media_id, "kind": kind, "sid": sid, "digest": digest,
                 "message_id": str(message_id), "occurrence": occurrence,
-                "nested": nested, "cache_path": None,
+                "history_occurrence": history_occurrence,
+                "nested": nested,
+                "cache_path": (self._catalog.get(media_id) or {}).get("cache_path"),
+                "volatile": raw_message_id is None,
             }
-            self._entries[media_id] = entry
         entry["elem"] = elem
-        entry["message"] = message
+        entry["message_ref"] = self._message_ref(message)
+        self._entries[media_id] = entry
+        self._entries.move_to_end(media_id)
         try:
             elem._media_access_id = media_id
         except Exception:
             pass
-        ids = self._message_entries.setdefault(id(message), [])
-        if media_id not in ids:
-            ids.append(media_id)
+        self._index_message(self._message_entries, message, media_id)
         return media_id
 
     def prepare_message(self, message, sid: str) -> None:
         """Index media/forwards synchronously; schedule metadata persistence off-loop."""
         if not self.any_enabled or not sid:
             return
+        self._bind_message(message)
         counters = {"Image": 0, "Sticker": 0, "Record": 0}
+        history_counters = {"Image": 0, "Sticker": 0, "Record": 0}
         forward_ids = []
 
         def walk(chain, nested=False, path=()):
@@ -130,7 +371,10 @@ class MediaAccessManager:
                             else "Image" if isinstance(elem, Image) else "Record")
                     occurrence = counters[kind]
                     counters[kind] += 1
-                    self._register_media(elem, kind, sid, message, occurrence, nested)
+                    history_occurrence = history_counters[kind]
+                    history_counters[kind] += 1
+                    self._register_media(
+                        elem, kind, sid, message, occurrence, nested, history_occurrence)
                 elif isinstance(elem, Reply) and elem.chain is not None:
                     walk(elem.chain, nested, path + ("r", index))
                 elif isinstance(elem, Forward):
@@ -147,17 +391,28 @@ class MediaAccessManager:
     def _register_forward(self, forward: Forward, sid: str, message, depth,
                           path, counters, visiting) -> str:
         actual_depth = depth or 1
-        message_id = getattr(message, "message_id", None) or f"runtime-{id(message)}"
-        forward_id = "f" + self._digest(sid, message_id, "forward", "/".join(map(str, path)))
+        raw_message_id = getattr(message, "message_id", None)
+        message_id = raw_message_id or f"runtime-{id(message)}"
+        path_text = "/".join(map(str, path))
+        digest = self._digest(sid, message_id, "forward", path_text)
+        forward_id = self._allocate_id("f", digest, sid, "forward")
         existing = self._forwards.get(forward_id)
         if existing is not None:
+            existing["message_ref"] = self._message_ref(message)
+            self._index_message(self._message_forwards, message, forward_id)
+            try:
+                forward._media_access_forward_id = forward_id
+            except Exception:
+                pass
             return forward_id
         record = {
-            "id": forward_id, "depth": actual_depth, "sid": sid,
-            "message_id": str(message_id), "children": [],
-            "message": message,
+            "id": forward_id, "depth": actual_depth, "sid": sid, "digest": digest,
+            "message_id": str(message_id), "path": path_text, "children": [],
+            "volatile": raw_message_id is None,
         }
+        record["message_ref"] = self._message_ref(message)
         self._forwards[forward_id] = record
+        self._index_message(self._message_forwards, message, forward_id)
         try:
             forward._media_access_forward_id = forward_id
         except Exception:
@@ -224,67 +479,215 @@ class MediaAccessManager:
                 self._replace_forward_elements(elem.chain)
 
     def _forward_id_for_element(self, target):
-        for forward_id, record in self._forwards.items():
-            message = record.get("message")
-            if message is not None:
-                # IDs are also written to the element during the first pass when possible.
-                if getattr(target, "_media_access_forward_id", None) == forward_id:
-                    return forward_id
         return getattr(target, "_media_access_forward_id", None)
 
-    def _schedule_persistence(self, message) -> None:
-        ids = list(self._message_entries.get(id(message), []))
-        forward_ids = [fid for fid, rec in self._forwards.items()
-                       if rec.get("message") is message]
-        if not ids and not forward_ids:
-            return
+    def _schedule_task(self, coro):
         try:
-            task = asyncio.create_task(self._persist_message(ids, forward_ids))
+            task = asyncio.create_task(coro)
         except RuntimeError:
             return
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    def _schedule_persistence(self, message) -> None:
+        ids = list(self._message_entries.get(id(message), []))
+        forward_ids = list(self._message_forwards.get(id(message), []))
+        if ids or forward_ids:
+            self._schedule_task(self._persist_message(ids, forward_ids))
+
+    def note_media_path(self, elem, path) -> None:
+        """Persist an already-known path; never downloads merely for display."""
+        media_id = getattr(elem, "_media_access_id", None)
+        entry = self._entries.get(media_id)
+        if entry is None or not path:
+            return
+        resolved = str(Path(path).resolve())
+        if entry.get("cache_path") == resolved:
+            return
+        entry["cache_path"] = resolved
+        if media_id not in self._persisting_ids:
+            self._schedule_task(self._persist_message([media_id], []))
+
     async def _persist_message(self, entry_ids, forward_ids) -> None:
+        self._persisting_ids.update(entry_ids)
+        try:
+            await self._persist_message_inner(entry_ids, forward_ids)
+        finally:
+            self._persisting_ids.difference_update(entry_ids)
+
+    async def _persist_message_inner(self, entry_ids, forward_ids) -> None:
         entries = [self._entries[mid] for mid in entry_ids if mid in self._entries]
         forwards = [self._forwards[fid] for fid in forward_ids if fid in self._forwards]
-        # 核心历史只保留 Forward 空壳；嵌套媒体在后台复用现有媒体缓存落盘，
-        # 目录仍只保存引用，不复制媒体字节。
+        stable_path = getattr(self.recognizer, "_is_stable_media_path", None)
         for entry in entries:
-            if not entry.get("nested") or entry.get("cache_path"):
+            elem = entry.get("elem")
+            raw = getattr(elem, "_temp_path", None)
+            current = entry.get("cache_path")
+            if (current and raw and stable_path is not None
+                    and not stable_path(current) and current == str(Path(raw).resolve())):
+                entry["cache_path"] = None
+            if not entry.get("cache_path") and raw:
+                if stable_path is None or stable_path(raw):
+                    entry["cache_path"] = str(Path(raw).resolve())
+        # 先保存轻量目录，慢媒体下载不再阻塞整棵 Forward 文本树。
+        mtimes = await asyncio.to_thread(self._persist_sync, entries, forwards)
+        await self._mark_persisted(entries, forwards, mtimes)
+        changed = []
+        for entry in entries:
+            if entry.get("cache_path"):
                 continue
             elem = entry.get("elem")
             if elem is None:
                 continue
+            # 纯按需不额外下载顶层 URL；嵌套媒体必须尽力为重启恢复落盘。
+            if (not entry.get("nested") and not self.prefetch_enabled
+                    and getattr(elem, "file_type", "") == "url"
+                    and not getattr(elem, "_temp_path", None)):
+                continue
             try:
-                path, _ = await self.recognizer._persist_media(elem)
+                persist = getattr(self.recognizer, "_persist_access_media", None)
+                if persist is None:
+                    persist = self.recognizer._persist_media
+                path, _ = await persist(elem)
                 if path:
                     entry["cache_path"] = str(Path(path).resolve())
+                    changed.append(entry)
             except Exception:
                 continue
-        await asyncio.to_thread(self._persist_sync, entries, forwards)
+        if changed:
+            mtimes = await asyncio.to_thread(self._persist_sync, changed, [])
+            await self._mark_persisted(changed, [], mtimes)
 
-    def _persist_sync(self, entries, forwards) -> None:
+    def _persist_sync(self, entries, forwards) -> dict:
+        mtimes = {}
         for directory in (self._entry_dir, self._forward_dir):
             directory.mkdir(parents=True, exist_ok=True)
         for entry in entries:
-            payload = {k: v for k, v in entry.items() if k not in ("elem", "message")}
-            self._atomic_json(self._entry_dir / f"{entry['id']}.json", payload)
+            payload = {k: v for k, v in entry.items() if k not in ("elem", "message_ref")}
+            path = self._entry_dir / f"{entry['id']}.json"
+            self._atomic_json(path, payload)
+            mtimes[entry["id"]] = path.stat().st_mtime
         for record in forwards:
-            payload = {k: v for k, v in record.items() if k != "message"}
-            self._atomic_json(self._forward_dir / f"{record['id']}.json", payload)
-        # Metadata is tiny; retain a strict bounded catalog without touching media bytes.
-        for directory in (self._entry_dir, self._forward_dir):
-            files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for old in files[2048:]:
-                try:
-                    old.unlink()
-                except OSError:
-                    pass
+            payload = {k: v for k, v in record.items() if k != "message_ref"}
+            path = self._forward_dir / f"{record['id']}.json"
+            self._atomic_json(path, payload)
+            mtimes[record["id"]] = path.stat().st_mtime
+        return mtimes
+
+    async def _mark_persisted(self, entries, forwards, mtimes=None):
+        now = time.time()
+        for kind, records in (("media", entries), ("forward", forwards)):
+            for record in records:
+                key = record["id"]
+                self._catalog[key] = {
+                    "kind": kind, "sid": record.get("sid"),
+                    "digest": self._entry_digest(record), "mtime": now,
+                    "cache_path": record.get("cache_path"),
+                    "file_mtime": (mtimes or {}).get(
+                        key, (self._catalog.get(key) or {}).get("file_mtime")),
+                }
+                digest = self._entry_digest(record)
+                if digest:
+                    self._identity_ids[(key[0], digest)] = key
+        await self._cleanup_catalog()
+
+    async def _cleanup_catalog(self):
+        now = time.monotonic()
+        if now - self._last_catalog_cleanup < self.CATALOG_CLEANUP_INTERVAL:
+            return
+        self._last_catalog_cleanup = now
+        protected = self._protected_message_ids() | set(self._reading_ids)
+        victims = set()
+        if self._catalog_max_age_seconds:
+            cutoff = time.time() - self._catalog_max_age_seconds
+            victims.update(key for key, meta in self._catalog.items()
+                           if meta.get("mtime", 0) < cutoff and key not in protected)
+        groups = {}
+        for key, meta in self._catalog.items():
+            groups.setdefault((meta.get("kind"), meta.get("sid")), []).append((meta.get("mtime", 0), key))
+        for records in groups.values():
+            records.sort(reverse=True)
+            victims.update(key for _mtime, key in records[self.CATALOG_SESSION_LIMIT:]
+                           if key not in protected)
+        ordered = sorted((meta.get("mtime", 0), key) for key, meta in self._catalog.items())
+        excess = max(0, len(self._catalog) - self.CATALOG_TOTAL_LIMIT)
+        if excess:
+            victims.update(key for _mtime, key in ordered[:excess] if key not in protected)
+        if not victims:
+            await self._save_catalog_snapshot()
+            return
+        paths = []
+        for key in victims:
+            meta = self._catalog.get(key) or {}
+            directory = self._forward_dir if meta.get("kind") == "forward" else self._entry_dir
+            paths.append((key, directory / f"{key}.json"))
+        deleted = await asyncio.to_thread(self._unlink_catalog_paths, paths)
+        for key in deleted:
+            meta = self._catalog.pop(key, None)
+            if meta and meta.get("digest"):
+                identity = (key[0], meta["digest"])
+                if self._identity_ids.get(identity) == key:
+                    self._identity_ids.pop(identity, None)
+        await self._save_catalog_snapshot()
+
+    @staticmethod
+    def _unlink_catalog_paths(paths):
+        deleted = []
+        for key, path in paths:
+            try:
+                path.unlink()
+                deleted.append(key)
+            except FileNotFoundError:
+                deleted.append(key)
+            except OSError:
+                pass
+        return deleted
+
+    async def _on_session_deleted(self, event):
+        payload = getattr(event, "payload", {}) or {}
+        sid = payload.get("session") if isinstance(payload, dict) else None
+        if sid:
+            await self.delete_session(str(sid))
+
+    async def delete_session(self, sid):
+        """Delete only this session's metadata; shared content-hash bytes stay in LRU."""
+        keys = [key for key, meta in self._catalog.items() if meta.get("sid") == sid]
+        paths = []
+        for key in keys:
+            meta = self._catalog[key]
+            directory = self._forward_dir if meta.get("kind") == "forward" else self._entry_dir
+            paths.append((key, directory / f"{key}.json"))
+        deleted = set(await asyncio.to_thread(self._unlink_catalog_paths, paths))
+        for key in keys:
+            meta = self._catalog.pop(key, None)
+            if meta and meta.get("digest"):
+                self._identity_ids.pop((key[0], meta["digest"]), None)
+            self._entries.pop(key, None)
+            self._forwards.pop(key, None)
+        for mapping in (self._message_entries, self._message_forwards):
+            for mid in list(mapping):
+                mapping[mid] = [key for key in mapping[mid] if key not in keys and key not in deleted]
+                if not mapping[mid]:
+                    mapping.pop(mid, None)
+        while len(self._message_refs) > self.MESSAGE_INDEX_LIMIT:
+            mid, _ref = self._message_refs.popitem(last=False)
+            self._message_entries.pop(mid, None)
+            self._message_forwards.pop(mid, None)
+        await self._save_catalog_snapshot()
+
+    def protected_paths(self):
+        paths = set()
+        ids = set(self._reading_ids) | self._protected_message_ids()
+        for key in ids:
+            entry = self._entries.get(key)
+            path = entry.get("cache_path") if entry else None
+            if path:
+                paths.add(str(path))
+        return paths
 
     @staticmethod
     def _atomic_json(path: Path, payload: dict) -> None:
-        tmp = path.with_suffix(".json.tmp")
+        tmp = path.with_suffix(f".{os.getpid()}.{id(payload)}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
 
@@ -293,7 +696,11 @@ class MediaAccessManager:
         return json.loads(path.read_text(encoding="utf-8"))
 
     async def _load(self, mapping: dict, directory: Path, key: str):
+        pattern = MEDIA_ID_RE if directory == self._entry_dir else FORWARD_ID_RE
+        if not isinstance(key, str) or not pattern.fullmatch(key):
+            return None
         if key in mapping:
+            mapping.move_to_end(key)
             return mapping[key]
         path = directory / f"{key}.json"
         try:
@@ -301,10 +708,22 @@ class MediaAccessManager:
             if not exists:
                 return None
             data = await asyncio.to_thread(self._read_json_sync, path)
+            file_mtime = await asyncio.to_thread(lambda: path.stat().st_mtime)
         except (OSError, ValueError):
             return None
         if isinstance(data, dict) and data.get("id") == key:
             mapping[key] = data
+            mapping.move_to_end(key)
+            kind = "media" if directory == self._entry_dir else "forward"
+            digest = self._entry_digest(data)
+            self._catalog[key] = {
+                "kind": kind, "sid": data.get("sid"), "digest": digest,
+                "mtime": time.time(), "cache_path": data.get("cache_path"),
+                "file_mtime": file_mtime,
+            }
+            if digest:
+                self._identity_ids[(key[0], digest)] = key
+            self._trim_runtime()
             return data
         return None
 
@@ -505,9 +924,11 @@ class MediaAccessManager:
         start = 0
         if cursor not in (None, ""):
             try:
-                start = max(0, int(cursor))
+                if isinstance(cursor, bool) or int(cursor) < 0 or str(cursor).strip() != str(int(cursor)):
+                    raise ValueError
+                start = int(cursor)
             except (TypeError, ValueError):
-                start = 0
+                return f"invalid_cursor：Forward {forward_id} 的分页游标无效，请使用上次返回的 cursor"
         page, size = [], 0
         for line in all_lines[start:]:
             if page and (len(page) >= 120 or size + len(line) + 1 > 6000):
@@ -592,6 +1013,7 @@ class MediaAccessManager:
             label = "Image" if kind == "Image" else "Sticker"
             placeholder = f"[{label} #{media_id}: 可读取{self._path_suffix(self._known_path(entry))}]"
             patterns = [rf"\[{label} attached\]", rf"\[{label}\s*, file_path: [^\]]+\]",
+                        rf"\[{label}\s+#[^\]\s:]+:\s*可读取(?:, file_path: [^\]]+)?\]",
                         rf"\[{label}\s*\]"]
             for pattern in patterns:
                 new_text, count = re.subn(pattern, lambda _: placeholder, text, count=1)
@@ -608,12 +1030,28 @@ class MediaAccessManager:
         if cache_path and Path(cache_path).is_file():
             kind = entry["kind"]
             if kind == "Image":
-                return Image(cache_path)
-            if kind == "Sticker":
-                return Sticker(sticker=cache_path)
-            return Record(cache_path)
+                elem = Image(cache_path)
+            elif kind == "Sticker":
+                elem = Sticker(sticker=cache_path)
+            else:
+                elem = Record(cache_path)
+            try:
+                elem._media_access_id = entry["id"]
+            except Exception:
+                pass
+            stable_path = getattr(self.recognizer, "_is_stable_media_path", None)
+            if stable_path is not None and not stable_path(cache_path):
+                try:
+                    path, _ = await self.recognizer._persist_access_media(elem)
+                    if path:
+                        entry["cache_path"] = str(Path(path).resolve())
+                        elem._temp_path = str(Path(path).resolve())
+                        self.note_media_path(elem, path)
+                except Exception:
+                    pass
+            return elem
         history = getattr(self.ctx, "message_history", None)
-        if history is None:
+        if history is None or entry.get("nested"):
             return None
         try:
             record = await history.get_message(
@@ -633,7 +1071,10 @@ class MediaAccessManager:
                 elif isinstance(elem, Reply) and elem.chain is not None:
                     walk(elem.chain)
         walk(record.chain)
-        index = int(entry.get("occurrence", 0))
+        index = entry.get("history_occurrence")
+        if index is None:
+            index = int(entry.get("occurrence", 0))
+        index = int(index)
         if index < len(matches):
             entry["elem"] = matches[index]
             return matches[index]
@@ -644,6 +1085,24 @@ class MediaAccessManager:
             raise RuntimeError("当前框架不支持原生媒体引用")
         return await store_session_media(elem, sid, message_id)
 
+    def _batch_candidates(self, event, forward=False):
+        result = []
+        mapping = self._message_forwards if forward else self._message_entries
+        for message in getattr(event, "messages", []) or []:
+            for key in mapping.get(id(message), []):
+                meta = self._catalog.get(key) or {}
+                if meta.get("sid") != getattr(event, "sid", None):
+                    continue
+                if not forward:
+                    enabled = self.image_tool_enabled if key[0] in "is" else self.audio_tool_enabled
+                    if not enabled:
+                        continue
+                if key not in result:
+                    result.append(key)
+                if len(result) >= 8:
+                    return result
+        return result
+
     async def read_media(self, event, media_ids) -> ToolResult:
         if isinstance(media_ids, str):
             ids = [x.strip() for x in media_ids.split(",") if x.strip()]
@@ -651,41 +1110,67 @@ class MediaAccessManager:
             ids = [str(x).strip() for x in media_ids if str(x).strip()]
         else:
             ids = []
+        ids = list(dict.fromkeys(ids))
         if not ids:
-            return ToolResult(text="请提供至少一个媒体 ID")
+            return ToolResult(text="invalid_id：请提供至少一个媒体 ID")
+        if len(ids) > self.MAX_BATCH_MEDIA:
+            return ToolResult(
+                text=f"batch_limit：一次最多读取 {self.MAX_BATCH_MEDIA} 个去重后的媒体；本次 {len(ids)} 个，未执行任何读取")
+
+        sid = getattr(event, "sid", None)
 
         async def one(media_id):
-            entry = await self._entry(media_id)
-            if entry is None:
-                return media_id, None, "媒体不存在或已过期"
-            kind = entry["kind"]
-            if not self._enabled_for(kind):
-                return media_id, None, "该类媒体的按需读取未开启"
-            elem = await self._resolve_media_element(entry)
-            if elem is None:
-                return media_id, None, "媒体源不可用，无法恢复"
+            if not MEDIA_ID_RE.fullmatch(media_id):
+                return media_id, None, (
+                    f"[Media #{media_id}: invalid_id；ID 格式无效，未执行读取。"
+                    "请逐字复制原始消息 # 后、冒号前的完整 ID，不要删除 i/s/r 等任何前缀]"), True
             try:
-                if self._is_visual(kind) and self.recognizer._native_mode(event.sid):
-                    ref = await self._store_media(elem, event.sid, entry["message_id"])
-                    path = (ref or {}).get("path") or await self._actual_media_path(entry)
-                    text = f"[{kind} #{media_id}: 已返回原生图片{self._path_suffix(path)}]"
-                    return media_id, ref, text
-                desc = await self.recognizer.read_access_entry(entry, event)
-                if not desc:
-                    return media_id, None, "识别失败或结果为空"
-                path = await self._actual_media_path(entry)
-                text = f"[{kind} #{media_id}: {desc}{self._path_suffix(path)}]"
-                return media_id, None, text
+                entry = await self._entry(media_id)
+                if entry is None or entry.get("sid") != sid:
+                    return media_id, None, (
+                        f"[Media #{media_id}: not_found；当前会话未找到该 ID。"
+                        "可能是复制错误、旧摘要或目录已清理；未执行媒体读取]"), True
+                kind = entry["kind"]
+                if not self._enabled_for(kind):
+                    return media_id, None, f"[{kind} #{media_id}: disabled；该类媒体的按需读取未开启]", False
+                self._reading_start(media_id)
+                try:
+                    elem = await self._resolve_media_element(entry)
+                    if elem is None:
+                        return media_id, None, (
+                            f"[{kind} #{media_id}: source_unavailable；目录存在，但媒体源、缓存和历史归档均不可恢复。"
+                            "媒体可能确已清理，可请用户重发]"), False
+                    if self._is_visual(kind) and self.recognizer._native_mode(sid):
+                        ref = await self._store_media(elem, sid, entry["message_id"])
+                        path = (ref or {}).get("path") or await self._actual_media_path(entry)
+                        text = f"[{kind} #{media_id}: 已返回原生图片{self._path_suffix(path)}]"
+                        return media_id, ref, text, False
+                    desc = await self.recognizer.read_access_entry(entry, event)
+                    if not desc:
+                        return media_id, None, f"[{kind} #{media_id}: recognition_failed；识别失败或结果为空]", False
+                    path = await self._actual_media_path(entry)
+                    text = f"[{kind} #{media_id}: {desc}{self._path_suffix(path)}]"
+                    return media_id, None, text, False
+                finally:
+                    self._reading_stop(media_id)
             except Exception as exc:
-                return media_id, None, f"读取失败：{type(exc).__name__}: {exc}"
+                # 已开始的读取由 inner finally 精确释放一次；开始前异常无需释放。
+                return media_id, None, f"[Media #{media_id}: read_failed；{type(exc).__name__}: {exc}]", False
 
         results = await asyncio.gather(*(one(mid) for mid in ids))
         lines, refs = [], []
-        for media_id, ref, text in results:
+        for media_id, ref, text, _retryable in results:
             lines.append(text)
             if ref is not None:
                 refs.append(ref)
-        return ToolResult(text="\n".join(lines), media_refs=refs)
+        if any(item[3] for item in results):
+            candidates = self._batch_candidates(event)
+            if candidates:
+                lines.append("[本批可读取 ID（仅供核对，未自动读取）：" + ", ".join(candidates) + "]")
+        unique_refs = {}
+        for ref in refs:
+            unique_refs[(ref.get("type"), ref.get("path"))] = ref
+        return ToolResult(text="\n".join(lines), media_refs=list(unique_refs.values()))
 
     async def _read_forward_one(self, event, forward_id: str, depth=1, cursor=None):
         record = await self._forward(forward_id)
@@ -700,10 +1185,16 @@ class MediaAccessManager:
                 for elem in chain:
                     if elem.get("type") == "forward":
                         child = await self._forward(elem["forward_id"])
-                        if child is not None:
-                            await load_tree(child, visiting)
+                        if child is not None and child.get("sid") == rec.get("sid"):
+                            self._reading_start(child["id"])
+                            try:
+                                await load_tree(child, visiting)
+                            finally:
+                                self._reading_stop(child["id"])
                     elif elem.get("type") == "media":
-                        await self._entry(elem["media_id"])
+                        entry = await self._entry(elem["media_id"])
+                        if entry is not None and entry.get("sid") != rec.get("sid"):
+                            self._entries.pop(elem["media_id"], None)
                     elif elem.get("type") == "reply" and elem.get("chain"):
                         await walk_chain(elem["chain"])
             for chain in rec.get("children", []):
@@ -711,24 +1202,28 @@ class MediaAccessManager:
 
         await load_tree(record, set())
         text = self.render_forward(forward_id, depth=depth, cursor=cursor)
-        ids = list(dict.fromkeys(re.findall(r"#([isr][0-9a-f]{12}): 可读取", text)))
+        ids = list(dict.fromkeys(re.findall(r"#([isr][0-9a-f]{8,64}): 可读取", text)))
 
         async def present(media_id):
             entry = await self._entry(media_id)
-            if entry is None or self._enabled_for(entry["kind"]):
+            if (entry is None or entry.get("sid") != getattr(event, "sid", None)
+                    or self._enabled_for(entry["kind"])):
                 return media_id, None, None, ""
-            elem = await self._resolve_media_element(entry)
-            if elem is None:
-                return media_id, None, "媒体源不可用", ""
+            self._reading_start(media_id)
             try:
+                elem = await self._resolve_media_element(entry)
+                if elem is None:
+                    return media_id, None, "source_unavailable", ""
                 if self._is_visual(entry["kind"]) and self.recognizer._native_mode(event.sid):
                     ref = await self._store_media(elem, event.sid, entry["message_id"])
                     path = (ref or {}).get("path") or await self._actual_media_path(entry)
                     return media_id, ref, "已返回原生图片", path
                 desc = await self.recognizer.read_access_entry(entry, event)
-                return media_id, None, desc or "读取失败", await self._actual_media_path(entry)
+                return media_id, None, desc or "recognition_failed", await self._actual_media_path(entry)
             except Exception as exc:
-                return media_id, None, f"读取失败：{type(exc).__name__}", ""
+                return media_id, None, f"read_failed: {type(exc).__name__}", ""
+            finally:
+                self._reading_stop(media_id)
 
         # 单个 Forward 内的媒体也并行；多个 Forward 由外层 gather 再并行一层。
         presented = await asyncio.gather(*(present(mid) for mid in ids))
@@ -743,10 +1238,21 @@ class MediaAccessManager:
         match = re.search(r"下一页 cursor=(\d+)", text)
         return text, refs, match.group(1) if match else None
 
+    @staticmethod
+    def _valid_cursor(value):
+        if value in (None, ""):
+            return True
+        if isinstance(value, bool):
+            return False
+        try:
+            return int(value) >= 0 and str(value).strip() == str(int(value))
+        except (TypeError, ValueError):
+            return False
+
     async def read_forward(self, event, forward_id=None, depth=1, cursor=None,
                            forward_ids=None) -> ToolResult:
         if not self.forward_tool_enabled:
-            return ToolResult(text="合并记录按需读取未开启")
+            return ToolResult(text="disabled：合并记录按需读取未开启")
         ids = []
         if isinstance(forward_ids, str):
             try:
@@ -763,23 +1269,52 @@ class MediaAccessManager:
             ids.insert(0, forward_id)
         ids = list(dict.fromkeys(str(x).strip() for x in ids if str(x).strip()))
         if not ids:
-            return ToolResult(text="请提供至少一个 Forward ID")
+            return ToolResult(text="invalid_id：forward_id 或 forward_ids 至少传一个")
+        if len(ids) > self.MAX_BATCH_FORWARDS:
+            return ToolResult(
+                text=f"batch_limit：一次最多读取 {self.MAX_BATCH_FORWARDS} 个去重后的 Forward；本次 {len(ids)} 个，未执行任何读取")
+
+        current = cursor
+        if isinstance(current, str) and current.strip().startswith("{"):
+            try:
+                current = json.loads(current)
+            except ValueError:
+                return ToolResult(text="invalid_cursor：多记录游标 JSON 无效，未执行任何读取")
+        if isinstance(current, dict):
+            if (any(not self._valid_cursor(value) for value in current.values())
+                    or any(key not in ids for key in current)):
+                return ToolResult(text="invalid_cursor：游标含无效值或不属于本批的 Forward ID，未执行任何读取")
+        elif len(ids) > 1 and current not in (None, ""):
+            return ToolResult(text="invalid_cursor：多记录分页须传上次返回的游标 JSON")
+        elif not self._valid_cursor(current):
+            return ToolResult(text="invalid_cursor：请使用上次返回的非负整数 cursor")
 
         def cursor_for(fid):
-            current = cursor
-            if isinstance(current, str) and current.strip().startswith("{"):
-                try:
-                    current = json.loads(current)
-                except ValueError:
-                    return None
             if isinstance(current, dict):
                 return current.get(fid)
             return current if len(ids) == 1 else None
 
-        results = await asyncio.gather(*(
-            self._read_forward_one(event, fid, depth, cursor_for(fid)) for fid in ids))
+        sid = getattr(event, "sid", None)
+
+        async def one(fid):
+            if not FORWARD_ID_RE.fullmatch(fid):
+                return fid, (f"[Forward #{fid}: invalid_id；请逐字复制 # 后、分隔符前的完整 ID，"
+                             "不要删除 f 等任何前缀]", [], None), True
+            try:
+                record = await self._forward(fid)
+                if record is None or record.get("sid") != sid:
+                    return fid, (f"[Forward #{fid}: not_found；当前会话未找到该目录，未执行读取]", [], None), True
+                self._reading_start(fid)
+                try:
+                    return fid, await self._read_forward_one(event, fid, depth, cursor_for(fid)), False
+                finally:
+                    self._reading_stop(fid)
+            except Exception as exc:
+                return fid, (f"[Forward #{fid}: read_failed；{type(exc).__name__}: {exc}]", [], None), False
+
+        results = await asyncio.gather(*(one(fid) for fid in ids))
         texts, refs, next_cursors = [], [], {}
-        for fid, (text, media_refs, next_cursor) in zip(ids, results):
+        for fid, (text, media_refs, next_cursor), _retryable in results:
             texts.append(text)
             refs.extend(media_refs)
             if next_cursor is not None:
@@ -789,16 +1324,32 @@ class MediaAccessManager:
             unique_refs[(ref.get("type"), ref.get("path"))] = ref
         if len(ids) > 1 and next_cursors:
             texts.append("[多记录分页游标：" + json.dumps(next_cursors) + "]")
+        if any(item[2] for item in results):
+            candidates = self._batch_candidates(event, forward=True)
+            if candidates:
+                texts.append("[本批可读取 Forward ID（仅供核对，未自动读取）：" + ", ".join(candidates) + "]")
         return ToolResult(text="\n\n".join(texts), media_refs=list(unique_refs.values()))
 
     async def shutdown(self) -> None:
+        if self._session_event_bus is not None:
+            try:
+                self._session_event_bus.unsubscribe("session_deleted", self._on_session_deleted)
+            except Exception:
+                pass
+            self._session_event_bus = None
+        self._initialized = False
         tasks = list(self._bg_tasks)
-        for task in tasks:
-            if not task.done():
-                task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(tasks, timeout=3.0)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         self._bg_tasks.clear()
+        try:
+            await self._save_catalog_snapshot()
+        except Exception:
+            pass
 
 
 _NATIVE_FILTERS = []
