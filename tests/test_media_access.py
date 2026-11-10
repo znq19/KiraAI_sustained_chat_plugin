@@ -62,7 +62,7 @@ def event(messages, group=True):
     return KiraMessageBatchEvent(
         timestamp=1,
         session=Session(adapter_name="qq", session_type="gm" if group else "dm",
-                        session_id="g" if group else "u"),
+                        session_id="427674145" if group else "u"),
         messages=messages,
     )
 

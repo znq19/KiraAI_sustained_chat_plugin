@@ -2100,8 +2100,12 @@ class ParallelMediaRecognizer:
         except Exception:
             return Path("data") / "plugins_media_cache"
 
-    async def _persist_media(self, elem, md5: Optional[str] = None):
-        """到达即落盘：url 型媒体字节持久化到插件自有缓存目录，并设置 elem._temp_path。
+    async def _persist_access_media(self, elem):
+        """Forward/历史恢复专用：URL、path、base64、data_url 都可落盘。"""
+        return await self._persist_media(elem, allow_non_url=True)
+
+    async def _persist_media(self, elem, md5: Optional[str] = None, allow_non_url: bool = False):
+        """到达即落盘：媒体字节持久化到插件自有缓存目录，并设置 elem._temp_path。
 
         返回 (path, md5v)：md5v 为内容 md5（调用方传入或现算）——Fix 2 让调用方
         「先落盘拿字节、md5 从字节现算」，url 型媒体全程只下载一次（旧实现
@@ -2115,16 +2119,24 @@ class ParallelMediaRecognizer:
         if not self.media_cache_enabled:
             return None, None
         try:
-            if getattr(elem, "file_type", "") != "url":
+            file_type = getattr(elem, "file_type", "")
+            if file_type != "url" and not allow_non_url:
+                return None, None
+            if file_type not in ("url", "path", "base64", "data_url"):
                 return None, None
             old = getattr(elem, "_temp_path", None)
             if old and os.path.exists(old):
+                try:
+                    self.access.note_media_path(elem, old)
+                except Exception:
+                    pass
                 return old, md5
             b64 = await asyncio.wait_for(elem.to_base64(), timeout=self.download_timeout)
             if not b64:
                 return None, None
             if b64.startswith("data:"):
                 b64 = b64.split(",", 1)[-1]
+            b64 = b64.removeprefix("base64://")
             data = base64.b64decode(b64)
             if not data:
                 return None, None
@@ -2155,7 +2167,7 @@ class ParallelMediaRecognizer:
                 if path.exists():
                     os.utime(path, None)   # 同内容文件已存在：刷新 mtime（LRU 热度）
                     return
-                tmp = cache_dir / f".{md5v}.{os.getpid()}.tmp"
+                tmp = cache_dir / f".{md5v}.{os.getpid()}.{id(data)}.tmp"
                 with open(tmp, "wb") as f:
                     f.write(data)
                 os.replace(tmp, path)      # 原子落盘，防并发读半截文件
@@ -2163,6 +2175,7 @@ class ParallelMediaRecognizer:
             await asyncio.to_thread(_write)
             try:
                 elem._temp_path = str(path)
+                self.access.note_media_path(elem, str(path))
             except Exception:
                 pass
             self._ensure_mc_cleanup()
@@ -2183,6 +2196,10 @@ class ParallelMediaRecognizer:
                 p = getattr((info or {}).get("elem"), "_temp_path", None)
                 if p:
                     out.add(str(p))
+        except Exception:
+            pass
+        try:
+            out.update(self.access.protected_paths())
         except Exception:
             pass
         return out

@@ -545,6 +545,11 @@ class DebouncePlugin(BasePlugin):
 
         # 启动聊天增强引擎（存在感/骚扰/休眠/通知合并）
         self.enhance.start()
+        # 媒体目录先加载轻量身份索引，保证8位ID与磁盘旧条目碰撞时安全扩展。
+        try:
+            await self.media_recognizer.access.initialize()
+        except Exception as e:
+            logger.warning(f"[MediaAccess] 目录身份索引加载失败，将按懒加载降级: {type(e).__name__}")
         # 启用媒体识别模块的框架 desc_img 安全接管（幂等；terminate 时还原）
         try:
             self.media_recognizer.activate()
@@ -3504,10 +3509,11 @@ class DebouncePlugin(BasePlugin):
     # ========== 按需媒体 / Forward 工具 ==========
     @register.tool(
         name="read_media",
-        description="按 ID 批量读取图片、动画表情或语音。消息含 [Image #id: 可读取]、[Sticker #id: 可读取]、[Record #id: 可读取] 且你需要其内容时调用。",
+        description="按需读取图片、动画表情或语音；仅在原始消息出现 [Image/Sticker/Record #完整ID: 可读取] 且需要内容时调用。ID 是 # 后、冒号前的完整字符串，必须逐字复制（含 i/s/r 前缀），不要删除前缀、猜测或从摘要、文件名、message_id 构造。",
         params={"type": "object", "properties": {"media_ids": {
-            "type": "array", "items": {"type": "string"},
-            "description": "一个或多个媒体 ID；同批多个媒体请一次传入，避免反复调用",
+            "type": "array", "maxItems": 16, "uniqueItems": True,
+            "items": {"type": "string", "pattern": "^[isr][0-9a-f]{8,64}$", "minLength": 9, "maxLength": 65},
+            "description": "完整媒体 ID 数组；同批多个一次传入，不要重复",
         }}, "required": ["media_ids"]},
     )
     async def read_media(self, event: KiraMessageBatchEvent, media_ids=None, **_):
@@ -3515,13 +3521,18 @@ class DebouncePlugin(BasePlugin):
 
     @register.tool(
         name="read_forward",
-        description="按需展开一个或多个合并聊天记录，内部并行处理。depth=1看当前层，N=向下N层，-1=拉取允许范围内全部剩余层；分页时传返回的 cursor。",
+        description="按需展开原始消息中的合并聊天记录；forward_id/forward_ids 至少传一个。ID 必须逐字复制并包含 f 前缀。depth=1 看当前层，N 向下 N 层，-1 读取允许范围内全部；分页传上次返回的 cursor。",
         params={"type": "object", "properties": {
-            "forward_id": {"type": "string", "description": "单记录兼容参数：Forward #id 中的 id"},
-            "forward_ids": {"type": "array", "items": {"type": "string"},
-                            "description": "可选：多个 Forward ID，一次并行读取"},
-            "depth": {"type": "integer", "default": 1},
-            "cursor": {"type": "string", "description": "分页游标或多记录游标JSON，可选"},
+            "forward_id": {"type": "string", "pattern": "^f[0-9a-f]{8,64}$",
+                           "minLength": 9, "maxLength": 65,
+                           "description": "单记录兼容参数：完整 Forward ID（含 f 前缀）"},
+            "forward_ids": {"type": "array", "maxItems": 8, "uniqueItems": True,
+                            "items": {"type": "string", "pattern": "^f[0-9a-f]{8,64}$",
+                                      "minLength": 9, "maxLength": 65},
+                            "description": "多个完整 Forward ID；一次并行读取，不要重复"},
+            "depth": {"type": "integer", "default": 1,
+                      "description": "1=当前层；N=向下N层；-1=允许范围内全部"},
+            "cursor": {"type": "string", "description": "单记录传上次 cursor；多记录传上次返回的游标 JSON；不要自行构造"},
         }, "required": []},
     )
     async def read_forward(self, event: KiraMessageBatchEvent, forward_id=None,
@@ -3538,9 +3549,9 @@ class DebouncePlugin(BasePlugin):
             self._filter_tools(req.tool_set, ["read_forward"], "exact")
         hints = []
         if access.image_tool_enabled or access.audio_tool_enabled:
-            hints.append("消息中的 [Image/Sticker/Record #id: 可读取] 可用 read_media 批量读取。")
+            hints.append("原始消息中的可读取媒体用 read_media；ID 是 # 后、冒号前的完整字符串，必须逐字复制，不得删除 i/s/r 等任何前缀或猜测。")
         if access.forward_tool_enabled:
-            hints.append("消息中的 [Forward #id: ...] 可用 read_forward 展开；depth=-1 可读允许范围内全部剩余层。")
+            hints.append("原始消息中的 [Forward #完整ID: ...] 可用 read_forward 展开；逐字复制含 f 前缀的完整 ID；depth=-1 可读允许范围内全部剩余层。")
         if not hints:
             return
         for p in req.system_prompt:
