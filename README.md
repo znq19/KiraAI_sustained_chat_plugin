@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.1
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -377,6 +377,13 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.8.2
+
+- **戳一戳归属修正（bot 自己的戳不再算用户互动）**：SnowLuma 私聊 poke notice 的 `user_id` 是**会话对端**（不是发起者），真正发起者在 `sender_id`（NapCat/LLOneBot 私聊与群聊仍是 `user_id`）。旧逻辑把所有 poke 当"真实用户互动"，且发起者取 `message.sender.user_id` ⇒ **bot 主动戳人会被记成"该用户戳了一下"**：存在感 +1、骚扰 poke 计数 +1，攒够阈值还会误发"少戳点"提醒。
+- **修法**：新增 `_poke_actor()` 统一解析发起者（非群聊优先 `sender_id`）；发起者 == `self_id` 时整条按系统事件跳过（不记存在感、不参与骚扰/额外信号统计）；`_sender_id()` 对 poke 也返回真实发起者。用户戳 bot / 用户戳用户 / 禁言等 notice / 普通消息行为**完全不变**。
+- **回归**：新增 `tests/test_poke_actor.py`（12 项，SnowLuma·NapCat·群聊三种字段形态 + 非 poke notice + 普通消息），并加入 `tests/run_tests.py` 套件；真实框架加载 10/10 通过。
+- 版本 2.8.1 → 2.8.2
 
 ### v2.8.1
 
