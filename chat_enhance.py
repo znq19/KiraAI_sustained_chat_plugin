@@ -136,6 +136,61 @@ def _is_self_message(event) -> bool:
         return False
 
 
+def _poke_raw(event):
+    """取 poke notice 的原始字段（兼容 event.raw_message / message.raw_message）。
+
+    Returns:
+        原始 dict（仅当确实是 notify/poke）；否则 None。
+    """
+    raw = getattr(event, "raw_message", None)
+    if raw is None:
+        raw = getattr(getattr(event, "message", None), "raw_message", None)
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("notice_type") != "notify" or raw.get("sub_type") != "poke":
+        return None
+    return raw
+
+
+def _poke_actor(event) -> str:
+    """戳一戳的**真正发起者**。
+
+    三家协议端字段语义不同（2026-11-18 实机核对 SnowLuma 源码）：
+      · SnowLuma 私聊：user_id = peerUin（会话对端，不是发起者）、
+                       sender_id = senderUin（发起者）、target_id = 被戳者
+      · NapCat / LLOneBot 私聊：user_id = 发起者（无 sender_id）
+      · 群聊三家一致：user_id = 发起者
+    所以**只在非群聊**时优先取 sender_id；取不到返回空串（调用方回落旧逻辑）。
+
+    Args:
+        event: 消息事件。
+
+    Returns:
+        发起者 QQ 字符串；非 poke 或取不到时为空串。
+    """
+    raw = _poke_raw(event)
+    if not raw:
+        return ""
+    actor = raw.get("user_id") or ""
+    if not raw.get("group_id"):
+        actor = raw.get("sender_id") or actor
+    return str(actor) if actor not in (None, "") else ""
+
+
+def _event_self_id(event) -> str:
+    """取事件所属 bot 的 QQ（多级兜底，取不到返回空串）。"""
+    candidates = [
+        getattr(event, "self_id", ""),
+        getattr(getattr(event, "message", None), "self_id", ""),
+        getattr(getattr(getattr(event, "adapter", None), "bot", None), "self_id", ""),
+    ]
+    for v in candidates:
+        s = str(v or "")
+        if s and s != "None":
+            return s
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 存在感节流
 # ---------------------------------------------------------------------------
@@ -1070,8 +1125,10 @@ class ChatEnhanceEngine:
     def _is_system_event(self, event) -> bool:
         """系统/通知事件判定：系统 sender（含 system_ 前缀）或无内容的系统通知。
 
-        poke 戳一戳（is_notice 但 sub_type=poke）除外——那是真实用户互动，
-        骚扰检测与存在感统计需要它。
+        poke 戳一戳（is_notice 但 sub_type=poke）通常算"真实用户互动"——
+        骚扰检测与存在感统计需要它。**但 bot 自己的戳除外**：
+        SnowLuma 私聊 poke 的 `user_id` 是会话对端、发起者在 `sender_id`，
+        旧逻辑会把"bot 主动戳人"记成"该用户戳了一下"（存在感/骚扰计数虚增）。
         """
         try:
             sender = getattr(getattr(getattr(event, "message", None), "sender", None), "user_id", "")
@@ -1079,12 +1136,14 @@ class ChatEnhanceEngine:
             if sender in self._SYSTEM_SENDER_IDS or sender.startswith("system_"):
                 return True
             if getattr(event, "is_notice", False):
-                raw = getattr(event, "raw_message", None)
-                if raw is None:
-                    raw = getattr(getattr(event, "message", None), "raw_message", None)
-                is_poke = isinstance(raw, dict) and raw.get("notice_type") == "notify" \
-                    and raw.get("sub_type") == "poke"
-                return not is_poke
+                if _poke_raw(event) is not None:
+                    actor = _poke_actor(event)
+                    self_id = _event_self_id(event)
+                    # bot 自己戳的（任何会话）→ 系统事件，整条跳过统计
+                    if actor and self_id and actor == self_id:
+                        return True
+                    return False
+                return True
         except Exception:
             pass
         return False
@@ -1099,11 +1158,13 @@ class ChatEnhanceEngine:
                 return None
         except Exception:
             pass
-        # 戳一戳：notice 事件
+        # 戳一戳：notice 事件（bot 自己的戳不算用户互动）
         if getattr(event, "is_notice", False):
-            raw = getattr(event, "raw_message", None)
-            if isinstance(raw, dict) and raw.get("notice_type") == "notify" \
-                    and raw.get("sub_type") == "poke":
+            if _poke_raw(event) is not None:
+                actor = _poke_actor(event)
+                self_id = _event_self_id(event)
+                if actor and self_id and actor == self_id:
+                    return None
                 return "poke"
             return None
         # 私聊消息：框架（qq.py 私聊路径）is_mentioned 写死 True（私聊=天然提及，
@@ -1125,6 +1186,13 @@ class ChatEnhanceEngine:
 
     @staticmethod
     def _sender_id(event) -> str:
+        # poke：发起者在 sender_id/正确字段里（私聊 user_id 是会话对端）
+        try:
+            actor = _poke_actor(event)
+            if actor:
+                return actor
+        except Exception:
+            pass
         try:
             return str(event.message.sender.user_id)
         except Exception:
