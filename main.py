@@ -1577,16 +1577,40 @@ class DebouncePlugin(BasePlugin):
                 parts.append("[引用回复]")
         return "".join(parts).strip()[:per_msg]
 
+    @staticmethod
+    def _jev_sender_label(message) -> str:
+        """JEV state 的说话人标签：与官方群消息一致，昵称 + 群名片都给。
+
+        3.3.0 起官方上下文是 `user_nickname: N, group_nickname: C`；JEV 作为
+        第二决策层必须看到同一套身份，否则同一句话在主模型和裁判眼里是两个人。
+        群名片与昵称相同时只留一个（去重，避免纯 token 浪费）；私聊 / 无名片 /
+        2.x 无该字段时只输出 `user_nickname`。名字先压成单行，防止名片里的
+        换行伪造出额外的 state 行。
+        """
+        sender = getattr(message, "sender", None)
+        raw_nick = getattr(sender, "nickname", "")
+        nickname = " ".join(raw_nick.split()) if isinstance(raw_nick, str) else ""
+        card = ""
+        if sender is not None and getattr(message, "group", None) is not None:
+            raw_card = getattr(sender, "group_nickname", None)
+            card = " ".join(raw_card.split()) if isinstance(raw_card, str) else ""
+        if card and not nickname:
+            return f"group_nickname: {card}"
+        if card and card != nickname:
+            return f"user_nickname: {nickname}, group_nickname: {card}"
+        if nickname:
+            return f"user_nickname: {nickname}"
+        return "?"
+
     def _render_msgs_for_jev(self, messages: list, max_msgs: int = 10,
                              per_msg: int = 300, total: int = 2000) -> str:
-        """把消息列表渲染成 JEV state 文本（昵称: 内容；媒体占位；从旧侧丢，保最新）。"""
+        """把消息列表渲染成 JEV state 文本（身份: 内容；媒体占位；从旧侧丢，保最新）。"""
         lines = []
         for m in messages[-max_msgs:]:
             try:
-                nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
                 text = self._render_chain_for_jev(getattr(m, "chain", None), per_msg)
                 if text:
-                    lines.append(f"[{nick}] {text}")
+                    lines.append(f"[{self._jev_sender_label(m)}] {text}")
             except Exception:
                 continue
         out = "\n".join(lines)
@@ -1678,7 +1702,10 @@ class DebouncePlugin(BasePlugin):
                             # 无游标回落时，排除比本批更新的记录（判定期间新到的）
                             if newest_ts and _safe_int(getattr(rec, "timestamp", 0), 0) > newest_ts:
                                 continue
-                            speaker = getattr(rec, "sender_name", None) or "?"
+                            # 档案表只存 sender_name（无群名片列）：这里只能给
+                            # user_nickname；群名片要等框架把 group_nickname 落库。
+                            _name = str(getattr(rec, "sender_name", None) or "").strip()
+                            speaker = f"user_nickname: {_name}" if _name else "?"
                         elif direction == "outgoing":
                             if getattr(rec, "status", "") != "sent":
                                 continue
@@ -1708,10 +1735,9 @@ class DebouncePlugin(BasePlugin):
                     mts = _safe_int(getattr(m, "timestamp", 0), 0)
                     if newest_ts and mts > newest_ts:
                         continue
-                    nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
                     text = self._render_chain_for_jev(getattr(m, "chain", None))
                     if text:
-                        lines.append(f"[{nick}] {text}")
+                        lines.append(f"[{self._jev_sender_label(m)}] {text}")
             except Exception:
                 return ""
         if not lines:
@@ -2595,12 +2621,27 @@ class DebouncePlugin(BasePlugin):
             messages = resp.get("data", {}).get("messages", [])
             result = []
             for msg in reversed(messages):
-                content = msg.get("raw_message", "")
-                sender = msg.get("sender", {})
-                nickname = sender.get("nickname", "")
+                content = msg.get("raw_message") or ""
+                sender = msg.get("sender")
+                if not isinstance(sender, dict):
+                    sender = {}
+                raw_nick = sender.get("nickname")
+                nickname = " ".join(raw_nick.split()) if isinstance(raw_nick, str) else ""
+                # 群名片只在群历史里有意义；与正常消息一致地同时给两个字段，
+                # 两者相同时去重（避免 `user_nickname: X, group_nickname: X`）。
+                raw_card = sender.get("card") if session_type != "dm" else None
+                card = " ".join(raw_card.split()) if isinstance(raw_card, str) else ""
+                if card and not nickname:
+                    label = f"group_nickname: {card}"
+                elif card and card != nickname:
+                    label = f"user_nickname: {nickname}, group_nickname: {card}"
+                elif nickname:
+                    label = f"user_nickname: {nickname}"
+                else:
+                    label = ""
                 result.append({
                     "role": "user",
-                    "content": f"[{nickname}]: {content}" if nickname else content
+                    "content": f"[{label}]: {content}" if label else content
                 })
             return result
         except Exception as e:

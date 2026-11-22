@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.2
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -377,6 +377,14 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.8.3
+
+- **3.3.0 群昵称对齐**：JEV 决策上下文（本批消息 / 缓冲回落 / 消息档案）不再只写一个昵称，改为与官方群消息一致的身份字段 `user_nickname: N, group_nickname: C`；群名片与昵称相同时自动去重，私聊不输出群名片。
+- **定时任务历史**：`get_group_msg_history` 同时读取 `sender.card`，群历史按同一口径输出昵称 + 群名片；私聊不带群名片，`sender` 非 dict 也不会异常。
+- **边界**：消息档案表（`message_history`）没有群名片列，档案路径只能给 `user_nickname`，其余路径正常；不修改任何 system prompt 或工具 schema，主对话的缓存前缀保持不变。
+- **回归**：`test_jev_decisions` 增加名片 / 同名 / 私聊 / 无名片 / 换行注入五种断言；新增 `test_history_speaker_format.py`（6 项）并加入 `run_tests.py`；真实框架 3.3.0 加载 10/10。
+- 版本 2.8.2 → 2.8.3
 
 ### v2.8.2
 
