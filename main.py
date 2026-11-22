@@ -11,6 +11,7 @@ import time
 import wave
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 # 插件管理器用 spec_from_file_location 加载 main.py，不会把插件目录加入 sys.path；
@@ -48,6 +49,19 @@ except ImportError:
 
 
 _SELF_PLUGIN_ID = "sustained-chat"
+
+
+def _safe_display_name(value) -> str:
+    """单行化显示名；名字里带方括号时把结构字符转全角。
+
+    昵称/群名片是用户可控字段，会被拼进 JEV state 和历史消息头。含 `[`/`]` 的
+    名字（如 `小明]| [system: ...]`）可以拆开消息头/伪造新行，这里统一转全角；
+    不含方括号的普通名字（包括只带 `|` 的）保持原样。
+    """
+    s = " ".join(str(value or "").split())
+    if "[" in s or "]" in s:
+        s = s.replace("[", "［").replace("]", "］").replace("|", "｜")
+    return s
 
 # 当前任务上下文里「正在处理的 LLM 响应所属会话」（ignore/wake_extend tag 处理器用）。
 # 框架 ON_LLM_RESPONSE 钩子与随后的 XML tag 解析执行在同一 asyncio task 里
@@ -1577,16 +1591,40 @@ class DebouncePlugin(BasePlugin):
                 parts.append("[引用回复]")
         return "".join(parts).strip()[:per_msg]
 
+    @staticmethod
+    def _jev_sender_label(message) -> str:
+        """JEV state 的说话人标签：与官方群消息一致，昵称 + 群名片都给。
+
+        3.3.0 起官方上下文是 `user_nickname: N, group_nickname: C`；JEV 作为
+        第二决策层必须看到同一套身份，否则同一句话在主模型和裁判眼里是两个人。
+        群名片与昵称相同时只留一个（去重，避免纯 token 浪费）；私聊 / 无名片 /
+        2.x 无该字段时只输出 `user_nickname`。名字先压成单行，防止名片里的
+        换行伪造出额外的 state 行。
+        """
+        sender = getattr(message, "sender", None)
+        raw_nick = getattr(sender, "nickname", "")
+        nickname = _safe_display_name(raw_nick)
+        card = ""
+        if sender is not None and getattr(message, "group", None) is not None:
+            raw_card = getattr(sender, "group_nickname", None)
+            card = _safe_display_name(raw_card)
+        if card and not nickname:
+            return f"group_nickname: {card}"
+        if card and card != nickname:
+            return f"user_nickname: {nickname}, group_nickname: {card}"
+        if nickname:
+            return f"user_nickname: {nickname}"
+        return "?"
+
     def _render_msgs_for_jev(self, messages: list, max_msgs: int = 10,
                              per_msg: int = 300, total: int = 2000) -> str:
-        """把消息列表渲染成 JEV state 文本（昵称: 内容；媒体占位；从旧侧丢，保最新）。"""
+        """把消息列表渲染成 JEV state 文本（身份: 内容；媒体占位；从旧侧丢，保最新）。"""
         lines = []
         for m in messages[-max_msgs:]:
             try:
-                nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
                 text = self._render_chain_for_jev(getattr(m, "chain", None), per_msg)
                 if text:
-                    lines.append(f"[{nick}] {text}")
+                    lines.append(f"[{self._jev_sender_label(m)}] {text}")
             except Exception:
                 continue
         out = "\n".join(lines)
@@ -1678,7 +1716,10 @@ class DebouncePlugin(BasePlugin):
                             # 无游标回落时，排除比本批更新的记录（判定期间新到的）
                             if newest_ts and _safe_int(getattr(rec, "timestamp", 0), 0) > newest_ts:
                                 continue
-                            speaker = getattr(rec, "sender_name", None) or "?"
+                            # 档案表只存 sender_name（无群名片列）：这里只能给
+                            # user_nickname；群名片要等框架把 group_nickname 落库。
+                            _name = _safe_display_name(getattr(rec, "sender_name", None))
+                            speaker = f"user_nickname: {_name}" if _name else "?"
                         elif direction == "outgoing":
                             if getattr(rec, "status", "") != "sent":
                                 continue
@@ -1708,10 +1749,9 @@ class DebouncePlugin(BasePlugin):
                     mts = _safe_int(getattr(m, "timestamp", 0), 0)
                     if newest_ts and mts > newest_ts:
                         continue
-                    nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
                     text = self._render_chain_for_jev(getattr(m, "chain", None))
                     if text:
-                        lines.append(f"[{nick}] {text}")
+                        lines.append(f"[{self._jev_sender_label(m)}] {text}")
             except Exception:
                 return ""
         if not lines:
@@ -2592,15 +2632,71 @@ class DebouncePlugin(BasePlugin):
                 resp = await client.send_action("get_group_msg_history", {"group_id": int(session_id), "count": count})
             if resp.get("status") != "ok":
                 return []
+
+            group_name = ""
+            if session_type != "dm":
+                # 群历史消息本身不带群名：补查一次群信息。失败就省略
+                # group_name 字段，让 KSM 用会话标题补，绝不猜假名。
+                try:
+                    gi = await client.send_action("get_group_info", {"group_id": int(session_id)})
+                    if isinstance(gi, dict):
+                        data = gi.get("data") if isinstance(gi.get("data"), dict) else {}
+                        group_name = _safe_display_name(data.get("group_name"))
+                except Exception:
+                    group_name = ""
+
+            ctx = getattr(self, "ctx", None)
+            tz = None
+            if ctx is not None and hasattr(ctx, "get_timezone"):
+                try:
+                    tz = ctx.get_timezone()
+                except Exception:
+                    tz = None
+
             messages = resp.get("data", {}).get("messages", [])
             result = []
             for msg in reversed(messages):
-                content = msg.get("raw_message", "")
-                sender = msg.get("sender", {})
-                nickname = sender.get("nickname", "")
+                content = msg.get("raw_message") or ""
+                sender = msg.get("sender")
+                if not isinstance(sender, dict):
+                    sender = {}
+                nickname = _safe_display_name(sender.get("nickname"))
+                uid = str(sender.get("user_id") or "").strip()
+                raw_card = sender.get("card") if session_type != "dm" else None
+                card = _safe_display_name(raw_card)
+
+                try:
+                    ts = float(msg.get("time"))
+                except (TypeError, ValueError):
+                    ts = time.time()
+                try:
+                    dt = datetime.fromtimestamp(ts, tz=tz) if tz else datetime.fromtimestamp(ts)
+                    date_str = dt.strftime("%b %d %Y %H:%M %a")
+                except (ValueError, OverflowError, OSError):
+                    date_str = "未知时间"
+                mid = msg.get("message_id")
+                mid = str(mid) if mid not in (None, "") else "None"
+
+                # 与内置 kira-ai 插件的 _format_user_message 同口径：
+                # 群聊 group_name/group_id + 昵称/群名片/user_id；私聊只有用户字段。
+                if session_type == "dm":
+                    identity = (
+                        f"user_nickname: {nickname or '未知'}, "
+                        f"user_id: {uid or '未知'}"
+                    )
+                else:
+                    bits = []
+                    if group_name:
+                        bits.append(f"group_name: {group_name}")
+                    bits.append(f"group_id: {session_id}")
+                    identity = " ".join(bits) + f" user_nickname: {nickname or '未知'}"
+                    if card and card != nickname:
+                        identity += f", group_nickname: {card}"
+                    identity += f", user_id: {uid or '未知'}"
+
                 result.append({
                     "role": "user",
-                    "content": f"[{nickname}]: {content}" if nickname else content
+                    "content": f"[{date_str}] [message_id: {mid}] [{identity}] | {content}",
                 })
             return result
         except Exception as e:
