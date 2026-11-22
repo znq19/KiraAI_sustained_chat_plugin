@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.3
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -377,6 +377,14 @@ croniter>=1.3.0
 
 <details>
 <summary>更新日志</summary>
+
+### v2.8.4
+
+- **定时历史行改为完整官方消息头**：`_fetch_history_from_api` 现在输出 `[时间] [message_id: X] [group_name: G group_id: G user_nickname: N, group_nickname: C, user_id: U] | 正文`（私聊为 `[时间] [message_id: X] [user_nickname: N, user_id: U] | 正文`），与内置 `kira-ai` 的格式化口径一致。群名通过一次 `get_group_info` 补查；失败则省略 `group_name` 字段，由 KSM 用会话标题补，不猜假名。
+- **为什么**：KSM 的来源判定要求群名/群号/昵称/user_id 齐全；只有昵称+名片的部分头部会被判为“缺字段”，从而丢掉群名或补不齐 user_id。完整头部让 KSM 只需补 `[session: sid]`，跨会话合并后群名、群号、发言人、QQ 号全部可见。
+- **安全**：昵称/群名片压成单行；名字含 `[` / `]` 时把方括号与 `|` 转全角，换行或 `]|` 都不会伪造新行。不修改 system prompt / 工具 schema / 主对话格式化，缓存前缀不变。
+- **回归**：`test_history_speaker_format.py` 扩到 7 项（完整头部 / 同名去重 / 私聊 / 空昵称 / 空身份 / 换行注入 / 群名查询失败）；真实框架加载 10/10。
+- 版本 2.8.3 → 2.8.4
 
 ### v2.8.3
 

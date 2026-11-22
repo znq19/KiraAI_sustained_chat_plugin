@@ -11,6 +11,7 @@ import time
 import wave
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 # 插件管理器用 spec_from_file_location 加载 main.py，不会把插件目录加入 sys.path；
@@ -48,6 +49,19 @@ except ImportError:
 
 
 _SELF_PLUGIN_ID = "sustained-chat"
+
+
+def _safe_display_name(value) -> str:
+    """单行化显示名；名字里带方括号时把结构字符转全角。
+
+    昵称/群名片是用户可控字段，会被拼进 JEV state 和历史消息头。含 `[`/`]` 的
+    名字（如 `小明]| [system: ...]`）可以拆开消息头/伪造新行，这里统一转全角；
+    不含方括号的普通名字（包括只带 `|` 的）保持原样。
+    """
+    s = " ".join(str(value or "").split())
+    if "[" in s or "]" in s:
+        s = s.replace("[", "［").replace("]", "］").replace("|", "｜")
+    return s
 
 # 当前任务上下文里「正在处理的 LLM 响应所属会话」（ignore/wake_extend tag 处理器用）。
 # 框架 ON_LLM_RESPONSE 钩子与随后的 XML tag 解析执行在同一 asyncio task 里
@@ -1589,11 +1603,11 @@ class DebouncePlugin(BasePlugin):
         """
         sender = getattr(message, "sender", None)
         raw_nick = getattr(sender, "nickname", "")
-        nickname = " ".join(raw_nick.split()) if isinstance(raw_nick, str) else ""
+        nickname = _safe_display_name(raw_nick)
         card = ""
         if sender is not None and getattr(message, "group", None) is not None:
             raw_card = getattr(sender, "group_nickname", None)
-            card = " ".join(raw_card.split()) if isinstance(raw_card, str) else ""
+            card = _safe_display_name(raw_card)
         if card and not nickname:
             return f"group_nickname: {card}"
         if card and card != nickname:
@@ -1704,7 +1718,7 @@ class DebouncePlugin(BasePlugin):
                                 continue
                             # 档案表只存 sender_name（无群名片列）：这里只能给
                             # user_nickname；群名片要等框架把 group_nickname 落库。
-                            _name = str(getattr(rec, "sender_name", None) or "").strip()
+                            _name = _safe_display_name(getattr(rec, "sender_name", None))
                             speaker = f"user_nickname: {_name}" if _name else "?"
                         elif direction == "outgoing":
                             if getattr(rec, "status", "") != "sent":
@@ -2618,6 +2632,27 @@ class DebouncePlugin(BasePlugin):
                 resp = await client.send_action("get_group_msg_history", {"group_id": int(session_id), "count": count})
             if resp.get("status") != "ok":
                 return []
+
+            group_name = ""
+            if session_type != "dm":
+                # 群历史消息本身不带群名：补查一次群信息。失败就省略
+                # group_name 字段，让 KSM 用会话标题补，绝不猜假名。
+                try:
+                    gi = await client.send_action("get_group_info", {"group_id": int(session_id)})
+                    if isinstance(gi, dict):
+                        data = gi.get("data") if isinstance(gi.get("data"), dict) else {}
+                        group_name = _safe_display_name(data.get("group_name"))
+                except Exception:
+                    group_name = ""
+
+            ctx = getattr(self, "ctx", None)
+            tz = None
+            if ctx is not None and hasattr(ctx, "get_timezone"):
+                try:
+                    tz = ctx.get_timezone()
+                except Exception:
+                    tz = None
+
             messages = resp.get("data", {}).get("messages", [])
             result = []
             for msg in reversed(messages):
@@ -2625,23 +2660,43 @@ class DebouncePlugin(BasePlugin):
                 sender = msg.get("sender")
                 if not isinstance(sender, dict):
                     sender = {}
-                raw_nick = sender.get("nickname")
-                nickname = " ".join(raw_nick.split()) if isinstance(raw_nick, str) else ""
-                # 群名片只在群历史里有意义；与正常消息一致地同时给两个字段，
-                # 两者相同时去重（避免 `user_nickname: X, group_nickname: X`）。
+                nickname = _safe_display_name(sender.get("nickname"))
+                uid = str(sender.get("user_id") or "").strip()
                 raw_card = sender.get("card") if session_type != "dm" else None
-                card = " ".join(raw_card.split()) if isinstance(raw_card, str) else ""
-                if card and not nickname:
-                    label = f"group_nickname: {card}"
-                elif card and card != nickname:
-                    label = f"user_nickname: {nickname}, group_nickname: {card}"
-                elif nickname:
-                    label = f"user_nickname: {nickname}"
+                card = _safe_display_name(raw_card)
+
+                try:
+                    ts = float(msg.get("time"))
+                except (TypeError, ValueError):
+                    ts = time.time()
+                try:
+                    dt = datetime.fromtimestamp(ts, tz=tz) if tz else datetime.fromtimestamp(ts)
+                    date_str = dt.strftime("%b %d %Y %H:%M %a")
+                except (ValueError, OverflowError, OSError):
+                    date_str = "未知时间"
+                mid = msg.get("message_id")
+                mid = str(mid) if mid not in (None, "") else "None"
+
+                # 与内置 kira-ai 插件的 _format_user_message 同口径：
+                # 群聊 group_name/group_id + 昵称/群名片/user_id；私聊只有用户字段。
+                if session_type == "dm":
+                    identity = (
+                        f"user_nickname: {nickname or '未知'}, "
+                        f"user_id: {uid or '未知'}"
+                    )
                 else:
-                    label = ""
+                    bits = []
+                    if group_name:
+                        bits.append(f"group_name: {group_name}")
+                    bits.append(f"group_id: {session_id}")
+                    identity = " ".join(bits) + f" user_nickname: {nickname or '未知'}"
+                    if card and card != nickname:
+                        identity += f", group_nickname: {card}"
+                    identity += f", user_id: {uid or '未知'}"
+
                 result.append({
                     "role": "user",
-                    "content": f"[{label}]: {content}" if label else content
+                    "content": f"[{date_str}] [message_id: {mid}] [{identity}] | {content}",
                 })
             return result
         except Exception as e:

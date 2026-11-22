@@ -177,7 +177,7 @@ async def run_gen(gen, core):
     # manifest 版本号
     import json as _json
     man = _json.loads((Path(PLUGIN_DIR) / "manifest.json").read_text(encoding="utf-8"))
-    check(gen, "manifest 版本为目标版", man.get("version") in ("2.8.1", "2.8.2", "2.8.3", "1.11.1", "1.11.2", "1.11.3"), man.get("version"))
+    check(gen, "manifest 版本为目标版", man.get("version") in ("2.8.1", "2.8.2", "2.8.3", "2.8.4", "1.11.1", "1.11.2", "1.11.3"), man.get("version"))
 
     # 钩子注册进框架 registry
     try:
