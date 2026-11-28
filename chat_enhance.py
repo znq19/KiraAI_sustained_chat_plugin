@@ -356,17 +356,6 @@ class HarassDetector:
     def __init__(self, cfg: dict, plugin):
         self._plugin = plugin
         self._load(cfg)
-        # 额外信号独立配置（user_msgs/bot_speech/session_msgs 不再兜落 poke 配置）
-        self._extra_conf = {
-            "allow_bot_duration": bool(cfg.get("extra_allow_bot_duration", True)),
-            "max_duration": _safe_int(cfg.get("extra_max_duration"), 300),
-            "default_duration": _safe_int(cfg.get("extra_default_duration"), 180),
-        }
-        # 作用域/白名单（全局，所有类型共用）：
-        # scope_sessions 非空时仅对这些会话检测（空=全部）；白名单命中不检测
-        self._scope_sessions = set(str(x) for x in (cfg.get("harass_scope_sessions") or []))
-        self._whitelist_users = set(str(x) for x in (cfg.get("harass_whitelist_users") or []))
-        self._whitelist_sessions = set(str(x) for x in (cfg.get("harass_whitelist_sessions") or []))
         # sid -> kind -> deque[(ts, user_id)]
         self._counts: dict[str, dict[str, deque]] = defaultdict(
             lambda: {k: deque(maxlen=256) for k in self.KINDS}
@@ -381,6 +370,20 @@ class HarassDetector:
         self._conf = {}
         for kind in self.KINDS:
             sec = cfg.get(f"section_{kind}", {}) or {}
+            if isinstance(sec, dict) and isinstance(sec.get("fields"), dict):
+                sec = sec["fields"]
+            # Z 版 schema 使用带前缀键（poke_enabled/at_threshold/…）；统一归一化。
+            pre = f"{kind}_"
+            if isinstance(sec, dict) and any(str(k).startswith(pre) for k in sec):
+                sec = {
+                    "enabled": sec.get(pre + "enabled", kind in ("poke", "at")),
+                    "window_seconds": sec.get(pre + "window_seconds", 60),
+                    "threshold": sec.get(pre + "threshold", 5 if kind == "keyword" else 3),
+                    "default_duration": sec.get(pre + "default_duration", 180),
+                    "allow_bot_duration": sec.get(pre + "allow_bot_duration", True),
+                    "max_duration": sec.get(pre + "max_duration", 300),
+                    "scope": sec.get(pre + "scope", "per_user"),
+                }
             self._conf[kind] = {
                 "enabled": bool(sec.get("enabled", kind in ("poke", "at"))),
                 "window": max(1.0, _safe_float(sec.get("window_seconds"), 60)),
@@ -390,6 +393,30 @@ class HarassDetector:
                 "max_duration": max(0, _safe_int(sec.get("max_duration"), 300)),
                 "scope": sec.get("scope", "per_user"),
             }
+        # 完整拉黑（<ignore>all / 全量拉黑）独立时长，不再借用 poke 配置
+        all_sec = cfg.get("section_ignore", {}) or {}
+        if isinstance(all_sec, dict) and isinstance(all_sec.get("fields"), dict):
+            all_sec = all_sec["fields"]
+        self._all_conf = {
+            "default_duration": max(1, _safe_int(all_sec.get("default_duration"), 180)),
+            "allow_bot_duration": bool(all_sec.get("allow_bot_duration", True)),
+            "max_duration": max(0, _safe_int(all_sec.get("max_duration"), 300)),
+        }
+        # 额外信号独立配置（user_msgs/bot_speech/session_msgs 不再兜落 poke 配置）
+        self._extra_conf = {
+            "allow_bot_duration": bool(cfg.get("extra_allow_bot_duration", True)),
+            "max_duration": _safe_int(cfg.get("extra_max_duration"), 300),
+            "default_duration": _safe_int(cfg.get("extra_default_duration"), 180),
+        }
+        # 作用域/白名单（全局，所有类型共用）：
+        # scope_sessions 非空时仅对这些会话检测（空=全部）；白名单命中不检测
+        self._scope_sessions = set(str(x) for x in (cfg.get("harass_scope_sessions") or []))
+        self._whitelist_users = set(str(x) for x in (cfg.get("harass_whitelist_users") or []))
+        self._whitelist_sessions = set(str(x) for x in (cfg.get("harass_whitelist_sessions") or []))
+
+    def reload(self, cfg: dict) -> None:
+        """热更新检测/屏蔽配置；保留已有计数与屏蔽状态。"""
+        self._load(cfg)
 
     # ---- 检测 ----
 
@@ -475,9 +502,12 @@ class HarassDetector:
     def apply_ignore(self, sid: str, user_id: str, kind: str, duration: int) -> str:
         """执行屏蔽。user_id='*' 表示该会话内所有用户；sid='*' 表示全局（所有会话）。
         kind='all' 时展开为全部 4 类（poke/at/keyword/reply）。返回结果文本。"""
-        # kind='all' 时用任一具体 kind 的配置（默认时长/钳制）；
-        # 额外信号（user_msgs/bot_speech/session_msgs）用独立 extra 配置（默认时长/钳制）
-        if kind in ("user_msgs", "bot_speech", "session_msgs"):
+        # 完整拉黑（all）使用 section_ignore 的独立时长/钳制；
+        # 额外信号（user_msgs/bot_speech/session_msgs）用独立 extra 配置；
+        # 其余单项（poke/at/keyword/reply）用各自配置。
+        if kind == "all":
+            conf = self._all_conf
+        elif kind in ("user_msgs", "bot_speech", "session_msgs"):
             conf = self._extra_conf
         else:
             conf = self._conf.get(kind) or self._conf.get("poke", {})
@@ -1004,18 +1034,23 @@ class ChatEnhanceEngine:
     def _build_extra_notice(self, kind: str, user_id: str, n: int, window: float, threshold: int) -> str:
         """额外信号通知。时长建议动态取配置允许的最大值（extra_max_duration，未启钳制时
         回落 extra_default_duration）；不教 -1（永久仅在 hint 中说明，避免绕过钳制）。
+        完整拉黑的建议时长取 section_ignore（与单项 extra 配置分离）。
         bot_speech 且 bot_speech_block_session 开启：建议会话级拉黑标签（<ignore>all|...>），
         输入即拉黑当前会话；关闭则仅提醒。user_msgs/session_msgs 仍教定向/全拉黑两选项。
         """
         label = {"user_msgs": f"user {user_id} sent", "session_msgs": "this session received",
                  "bot_speech": "you spoke"}[kind]
         dur = self.extra_max_duration if self.extra_max_duration > 0 else self.extra_default_duration
+        all_conf = self.harass._all_conf
+        all_dur = (all_conf["max_duration"]
+                   if all_conf["allow_bot_duration"] and all_conf["max_duration"] > 0
+                   else all_conf["default_duration"])
         if kind == "bot_speech":
             if self.bot_speech_block_session:
                 return (
                     f"[System: you spoke {n} messages in {int(window)}s (threshold {threshold}). "
-                    f"Reply with <ignore>all|duration:{dur}</ignore> to block this session "
-                    f"(all messages stop entering the LLM, restore after {dur}s), "
+                    f"Reply with <ignore>all|duration:{all_dur}</ignore> to block this session "
+                    f"(all messages stop entering the LLM, restore after {all_dur}s), "
                     f"or <ignore>none</ignore> to do nothing.]"
                 )
             return (
@@ -1025,8 +1060,8 @@ class ChatEnhanceEngine:
         return (
             f"[System: {label} {n} messages in {int(window)}s (threshold {threshold}). "
             f"Reply with <ignore>user:{user_id}|type:{kind}|duration:{dur}</ignore> to block "
-            f"this user\'s {kind}, or <ignore>user:{user_id}|duration:{dur}</ignore> to fully "
-            f"block, or <ignore>none</ignore> to do nothing. Ignore lasts {dur}s (max allowed).]"
+            f"this user\'s {kind} for {dur}s, or <ignore>user:{user_id}|duration:{all_dur}</ignore> "
+            f"to fully block for {all_dur}s, or <ignore>none</ignore> to do nothing.]"
         )
 
     def on_im_message(self, event) -> None:

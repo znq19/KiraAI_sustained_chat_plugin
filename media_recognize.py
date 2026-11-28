@@ -731,6 +731,11 @@ class ParallelMediaRecognizer:
         info = bucket.get(short_id)
         if not isinstance(info, dict):
             return
+        if getattr(elem, "_media_skip", False):
+            # 语音按需工具模式：宿主已判定本次不自动识别，只保留 [Record #id]
+            # 占位给 read_media，绝不预取/STT。
+            info["_done"] = True
+            return
         md5 = None
         try:
             _p, md5 = await self._persist_media(elem)   # url 型仅这次下载

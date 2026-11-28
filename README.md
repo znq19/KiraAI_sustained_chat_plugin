@@ -311,6 +311,7 @@ AI: 对了主人，我刚刚看到一个好笑的视频，想不想看？
 | `section_media_recognition` | 并行媒体识别（图片 VLM + 语音 STT 并行预处理，回复更快）；内含**避免重复识图（省 token）**开关：避免触发原有 VLM 重复识别、浪费 token，默认开，如确有兼容需要可关闭 |
 | `section_presence` | 存在感节流 + **提及消息评分（群聊/私聊）** |
 | `section_poke` / `section_at` / `section_keyword` / `section_reply` | 骚扰感知化（戳/at/关键词/引用检测 + XML 决策屏蔽） |
+| `section_ignore` | 完整拉黑（`<ignore>all` / 全量拉黑）的独立默认/最大时长与 bot 自设开关，不再借用戳一戳配置；支持热更新 |
 | `section_dormant` | 休眠时段（起夜概率 + 维持期 + 主动续窗限制） |
 | `section_jev` | JEV 触发决策（可选 · 默认关）：群聊空停守望（一次性）/ 私聊空停守望（默认关）/ 概率与持续命中复核补触发 / 私聊主动复核；判定附带上下文条数、人格注入、三套可自定义提示词；模型下拉借道 webui 提供商（有序回退链），支持小模型判官后端 |
 
@@ -384,7 +385,9 @@ croniter>=1.3.0
 - **修法（不修改框架）**：新增 `forward_raw.py`，按协议端原始报文补全插件自己的轻量树。支持 `data.content` 内联节点、`data.id`/`res_id`/`forward_id`、NapCat node 包裹、node 段嵌套、`xml viewMultiMsg` 卡片（`m_resid`/`m_fileName`）；原框架解析结果、媒体 ID、首轮预览全部保留，只补缺失层。
 - **安全边界**：单棵树总预算 12s、单次请求 8s、最多 32 次拉取、2000 个节点、深度上限 64；循环引用/超深/拉取失败只返回明确占位，不阻塞消息链路。补全失败保留原树，60 秒后可重试；媒体仍按需 `read_media`，不改变 prompt/工具 schema/缓存前缀。
 - **NapCat 兜底**：框架整体丢弃顶层 forward（node 包裹导致 `TypeError`）时，插件会补一条 `[Forward #…｜可用 read_forward(…) 查看]` 预览并生成可读取记录，不再整段消失。
-- **回归**：新增 `tests/test_forward_raw.py`（31 项断言：内联 content、id 嵌套、部分解析续钻、LLOneBot content、NapCat 包裹、顶层 XML 卡片、node 层、循环、深度、失败保留、嵌套媒体、重启恢复、XML 卡片、引用补全）；`test_media_access` 等全量套件通过；真实 KiraAI 3.3.0 / 3.4.0 加载 10/10，真实适配器端到端 SnowLuma/NapCat/LLOneBot 三种形态均可读到嵌套正文。
+- **完整拉黑（all）独立配置 + 热更新**：`<ignore>all` / `manage_ignore(block_type=all)` 的默认时长、是否允许 bot 自设、最大时长改由独立 `section_ignore` 控制，不再回落到戳一戳配置；`HarassDetector.reload()` + 消息入口/标签/工具调用前读取当前插件配置，WebUI 改完无需重启，已有计数与屏蔽状态保留。
+- **按需媒体设置联动修复**：语音按需工具开启时，`voice_recognition_only_on_mention` / `voice_private_need_mention` / `voice_max_duration` 不再提前把 Record 换成 `[语音]`/`[长语音]`，而是保留元素供 `read_media`；native 模式补上 `image_recognition_probability`，超限图片在图片工具开启时保留元素而不是直接换成占位；工具关闭时维持原占位行为。
+- **回归**：新增 `tests/test_forward_raw.py`（31 项断言：内联 content、id 嵌套、部分解析续钻、LLOneBot content、NapCat 包裹、顶层 XML 卡片、node 层、循环、深度、失败保留、嵌套媒体、重启恢复、XML 卡片、引用补全）；`test_media_access` 等全量套件通过；真实 KiraAI 3.3.0 / 3.4.0 加载 10/10，真实适配器端到端 SnowLuma/NapCat/LLOneBot 三种形态均可读到嵌套正文。 新增 `tests/test_ignore_all_config.py`（6 项：all 独立默认/钳制/热更新/单项隔离）；`test_media_tool_pipeline` 增加按需语音/超长语音/native 仅唤醒/概率/超限共 10 项。
 - 版本 2.8.4 → 2.8.5
 
 ### v2.8.4
