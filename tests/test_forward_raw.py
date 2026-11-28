@@ -5,6 +5,7 @@ one level of Forward.chains, so ``read_forward(depth=2)`` returned
 ``还可下钻0层`` even though the original record contained inline/nested nodes.
 """
 import asyncio
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -281,6 +282,70 @@ async def run(plugin_dir: Path):
     text = (await manager.read_forward(batch([obj]), root_fid, depth=-1)).text if root_fid else ""
     check("LLOneBot content：外层可读", "LLOneBot 外层" in text, text)
     check("LLOneBot content：嵌套可读", "LLOneBot 深层" in text, text)
+    await manager.shutdown()
+
+    # ---------------- 3c. SnowLuma XML card: try m_fileName if m_resid fails ----------------
+    card_xml = ('<msg serviceID="35" action="viewMultiMsg" m_resid="BAD-RES" '
+                'm_fileName="GOOD-RES">聊天记录</msg>')
+    client = FakeClient({
+        "CARD-OUT": [{"sender": {"nickname": "A"}, "time": 1700000001, "message": [
+            {"type": "xml", "data": {"data": card_xml}}]}],
+        "GOOD-RES": [flat("B", 1700000002, "SnowLuma 卡片深层")],
+    })
+    manager, _ = make_manager(module, client)
+    obj = message(MessageChain([Text("前缀")]), {"message": [
+        {"type": "forward", "data": {"id": "CARD-OUT"}}]})
+    manager.prepare_message(obj, SID)
+    await settle(manager)
+    root_fid = next((getattr(x, "_media_forward_id", None) for x in obj.chain
+                     if isinstance(x, Text) and getattr(x, "_media_forward_id", None)), None)
+    card_text = (await manager.read_forward(batch([obj]), root_fid, depth=-1)).text
+    check("SnowLuma XML：m_resid 失败后回退 m_fileName",
+          "SnowLuma 卡片深层" in card_text, card_text)
+    await manager.shutdown()
+
+    # ---------------- 3c2. card ids unusable -> get_msg(parent message_id) ----------------
+    bad_card = '<msg action="viewMultiMsg" m_resid="BAD" m_fileName="ALSO-BAD">聊天记录</msg>'
+    client = FakeClient({
+        "MSG-OUT": [{"sender": {"nickname": "A"}, "time": 1700000001,
+                     "message_id": "inner-msg", "message": [
+                         {"type": "xml", "data": {"data": bad_card}}]}],
+        "REAL-RES": [flat("B", 1700000002, "get_msg 回退深层")],
+    }, msg_payloads={
+        "inner-msg": {"sender": {"nickname": "A"}, "time": 1700000001,
+                      "message": [{"type": "forward", "data": {"id": "REAL-RES"}}]},
+    })
+    manager, _ = make_manager(module, client)
+    obj = message(MessageChain([Text("前缀")]), {"message": [
+        {"type": "forward", "data": {"id": "MSG-OUT"}}]})
+    manager.prepare_message(obj, SID)
+    await settle(manager)
+    root_fid = next((getattr(x, "_media_forward_id", None) for x in obj.chain
+                     if isinstance(x, Text) and getattr(x, "_media_forward_id", None)), None)
+    fallback_text = (await manager.read_forward(batch([obj]), root_fid, depth=-1)).text
+    check("卡片无有效 ID：get_msg 父消息回退", "get_msg 回退深层" in fallback_text, fallback_text)
+    await manager.shutdown()
+
+    # ---------------- 3d. LightApp / JSON multimsg card ----------------
+    card_json = json.dumps({
+        "app": "com.tencent.multimsg",
+        "meta": {"detail": {"resid": "JSON-RES", "uniseq": "u1"}},
+    }, ensure_ascii=False)
+    client = FakeClient({
+        "JSON-OUT": [{"sender": {"nickname": "A"}, "time": 1700000001, "message": [
+            {"type": "json", "data": {"data": card_json}}]}],
+        "JSON-RES": [flat("B", 1700000002, "JSON 卡片深层")],
+    })
+    manager, _ = make_manager(module, client)
+    obj = message(MessageChain([Text("前缀")]), {"message": [
+        {"type": "forward", "data": {"id": "JSON-OUT"}}]})
+    manager.prepare_message(obj, SID)
+    await settle(manager)
+    root_fid = next((getattr(x, "_media_forward_id", None) for x in obj.chain
+                     if isinstance(x, Text) and getattr(x, "_media_forward_id", None)), None)
+    json_text = (await manager.read_forward(batch([obj]), root_fid, depth=-1)).text
+    check("LightApp JSON 卡片：按 meta.detail.resid 展开",
+          "JSON 卡片深层" in json_text, json_text)
     await manager.shutdown()
 
     # ---------------- 4. cycle is bounded ----------------

@@ -21,15 +21,18 @@ from core.chat.message_elements import Text, Image, Sticker, Record, Reply, Forw
 from core.utils.path_utils import get_data_path
 from forward_raw import (
     RawForward,
+    card_ids,
     collect_nested,
     extract_forward_descriptors,
     first_str,
+    is_json_forward_card,
+    json_forward_id,
     message_object,
     message_payload,
     node_meta,
     node_segments,
     segment_node_parts,
-    xml_res_id,
+    xml_text,
 )
 
 try:
@@ -647,7 +650,7 @@ class MediaAccessManager:
             return
         if record.get("hydrated"):
             return
-        if not (raw.id or raw.content or raw.kind in ("node", "xml")):
+        if not (raw.id or raw.content or raw.kind in ("node", "xml", "json")):
             return
         retry_after = record.get("retry_after") or 0
         if retry_after > time.time():
@@ -798,13 +801,44 @@ class MediaAccessManager:
         return getattr(adapter, "bot", None)
 
     async def _call_get_forward(self, client, source_id: str):
+        errors = []
+        empty_resp = None
+
+        def _valid(resp):
+            nonlocal empty_resp
+            try:
+                messages = message_payload(resp)
+                if messages:
+                    return True
+                if empty_resp is None:
+                    empty_resp = resp
+                return False
+            except Exception:
+                return False
+
         method = getattr(client, "get_forward_msg", None)
         if callable(method):
-            return await method(source_id)
+            try:
+                resp = await method(source_id)
+                if _valid(resp):
+                    return resp
+                errors.append("get_forward_msg(message_id) invalid response")
+            except Exception as exc:
+                errors.append(f"get_forward_msg(message_id): {exc}")
         send = getattr(client, "send_action", None)
         if callable(send):
-            return await send("get_forward_msg", {"message_id": source_id})
-        raise RuntimeError("adapter client has no get_forward_msg")
+            for params in ({"message_id": source_id}, {"id": source_id},
+                           {"res_id": source_id}):
+                try:
+                    resp = await send("get_forward_msg", params)
+                    if _valid(resp):
+                        return resp
+                    errors.append(f"send_action({params}) invalid response")
+                except Exception as exc:
+                    errors.append(f"send_action({params}): {exc}")
+        if empty_resp is not None:
+            return empty_resp
+        raise RuntimeError("; ".join(errors) or "adapter client has no get_forward_msg")
 
     async def _call_get_msg(self, client, message_id: str):
         method = getattr(client, "get_msg", None)
@@ -856,21 +890,51 @@ class MediaAccessManager:
             if raw.id:
                 return await self._fetch_forward_nodes(raw.id, ctx)
             return []
-        if raw.kind == "xml":
-            resid = raw.id or xml_res_id(raw.data)
-            if resid:
-                return await self._fetch_forward_nodes(resid, ctx)
+        if raw.kind in ("xml", "json"):
+            for resid in [raw.id] + card_ids(raw.data):
+                if not resid:
+                    continue
+                try:
+                    nodes = await self._fetch_forward_nodes(resid, ctx)
+                except Exception:
+                    continue
+                if nodes:
+                    return nodes
             return []
         if raw.id:
             return await self._fetch_forward_nodes(raw.id, ctx)
         return None
+
+    async def _fetch_forward_via_message_id(self, message_id: str, ctx) -> list:
+        """Some cards only carry a normal message id; get_msg can expose a forward segment."""
+        if not message_id:
+            return []
+        client = self._client_for(ctx.sid)
+        if client is None:
+            return []
+        try:
+            resp = await asyncio.wait_for(
+                self._call_get_msg(client, message_id), timeout=RAW_FORWARD_TIMEOUT)
+        except Exception:
+            return []
+        data = message_object(resp)
+        if not data:
+            return []
+        for desc in self._extract_raw_forwards(data):
+            try:
+                nodes = await self._raw_nodes_for(desc, ctx)
+            except Exception:
+                nodes = None
+            if nodes:
+                return nodes
+        return []
 
     async def _hydrate_forward(self, record, raw: RawForward, sid, message) -> None:
         if record.get("depth", 1) > min(self.forward_max_depth, RAW_FORWARD_MAX_DEPTH):
             record["truncated"] = "depth"
             record["hydrated"] = True
             return
-        if raw.kind == "xml" and not (raw.id or xml_res_id(raw.data)):
+        if raw.kind in ("xml", "json") and not (raw.id or card_ids(raw.data)):
             record["truncated"] = "xml_card"
             record["hydrated"] = True
             return
@@ -900,7 +964,7 @@ class MediaAccessManager:
             self._trim_runtime()
         except Exception as exc:
             record["hydration_error"] = f"{type(exc).__name__}: {exc}"
-            if raw.kind == "xml":
+            if raw.kind in ("xml", "json"):
                 record["truncated"] = "xml_card"
             elif not record.get("children") and not record.get("truncated"):
                 record["truncated"] = "fetch_failed"
@@ -1003,16 +1067,22 @@ class MediaAccessManager:
     async def _serialize_raw_node(self, node, ctx, depth, path) -> list:
         meta = node_meta(node)
         segments = node_segments(node)
+        raw_node = node.get("data") if isinstance(node, dict) and node.get("type") == "node" else node
+        node_mid = ""
+        if isinstance(raw_node, dict):
+            node_mid = first_str(raw_node.get("message_id"), raw_node.get("msgId"),
+                                 raw_node.get("real_id"))
         chain = [{"type": "text",
                   "text": f"[{self._format_raw_time(meta['time'])}] {self._clean_name(meta['name'])}: "}]
         for index, seg in enumerate(segments):
             chain.extend(await self._serialize_raw_segment(
-                seg, ctx, depth, tuple(path) + (index,)))
+                seg, ctx, depth, tuple(path) + (index,), fallback_message_id=node_mid))
         if not segments:
             chain.append({"type": "text", "text": "[空消息]"})
         return chain
 
-    async def _serialize_raw_segment(self, seg, ctx, depth, path) -> list:
+    async def _serialize_raw_segment(self, seg, ctx, depth, path,
+                                     fallback_message_id: str = "") -> list:
         if not isinstance(seg, dict):
             return [{"type": "text", "text": str(seg)}] if seg else []
         kind = seg.get("type")
@@ -1061,15 +1131,22 @@ class MediaAccessManager:
                      "message_content": first_str(
                          data.get("content"), data.get("message_content")), "chain": []}]
         if kind == "json":
+            if is_json_forward_card(data):
+                desc = RawForward(kind="json", id=json_forward_id(data), data=data,
+                                  message_id=fallback_message_id)
+                return await self._make_nested_forward(
+                    desc, ctx, depth, tuple(path) + ("json",))
             return [{"type": "json", "text": self._raw_card_text(data)}]
         if kind == "xml":
             desc = collect_nested([seg])
             if desc and desc[0].kind == "xml":
+                desc[0].message_id = fallback_message_id
                 return await self._make_nested_forward(desc[0], ctx, depth, tuple(path) + ("xml",))
             return [{"type": "text", "text": "[XML消息]"}]
         if kind == "forward":
             desc = collect_nested([seg])
             if desc:
+                desc[0].message_id = fallback_message_id
                 return await self._make_nested_forward(desc[0], ctx, depth, tuple(path) + ("f",))
             return [{"type": "text", "text": "[空合并记录]"}]
         if kind == "node":
@@ -1082,7 +1159,7 @@ class MediaAccessManager:
                 return [{"type": "text", "text": "[空消息]"}]
             # 合并记录内部出现的 node 段就是协议端的嵌套记录边界（NapCat 的
             # get_forward_msg 会把嵌套 forward 递归成 node.data.message）。
-            desc = RawForward(kind="node", data=data)
+            desc = RawForward(kind="node", data=data, message_id=fallback_message_id)
             return await self._make_nested_forward(desc, ctx, depth, tuple(path) + ("n",))
         if kind in ("markdown",):
             return [{"type": "text", "text": first_str(data.get("content"), data.get("text"), "[Markdown]")}]
@@ -1132,20 +1209,37 @@ class MediaAccessManager:
                 truncated = "cycle"
             else:
                 nodes = []
-        elif desc.kind == "xml":
-            resid = desc.id or xml_res_id(desc.data)
-            if resid and resid not in ctx.visited:
+        elif desc.kind in ("xml", "json"):
+            candidates = []
+            for value in [desc.id] + card_ids(desc.data):
+                if value and value not in candidates:
+                    candidates.append(value)
+            if not candidates:
+                truncated = "xml_card"
+            for resid in candidates:
+                if resid in ctx.visited:
+                    continue
                 ctx.visited.add(resid)
                 try:
                     nodes = await self._fetch_forward_nodes(resid, ctx)
                 except Exception:
-                    truncated = "xml_card"
+                    nodes = None
                 finally:
                     ctx.visited.discard(resid)
-            else:
+                if nodes:
+                    break
+            if not nodes:
                 truncated = "xml_card"
-            if not nodes and not truncated:
-                truncated = "xml_card"
+                logger.debug(f"[MediaAccess] {desc.kind} forward card unresolved: "
+                             f"ids={candidates} xml_len={len(xml_text(desc.data)) if desc.kind == 'xml' else 0}")
+        if not nodes and getattr(desc, "message_id", ""):
+            key = "msg:" + str(desc.message_id)
+            if key not in ctx.visited:
+                ctx.visited.add(key)
+                try:
+                    nodes = await self._fetch_forward_via_message_id(desc.message_id, ctx)
+                finally:
+                    ctx.visited.discard(key)
         if nodes is None:
             nodes = []
         record = self._new_raw_forward_record(ctx, depth, path, desc, truncated)
