@@ -38,7 +38,11 @@
       "adaptive_merge_mode": {
         "type": "string",
         "name": "动态合并倾向",
-        "options": ["responsive", "balanced", "merge_first"],
+        "options": [
+          "responsive",
+          "balanced",
+          "merge_first"
+        ],
         "default": "balanced",
         "hint": "responsive=P60（响应优先）、balanced=P75（均衡）、merge_first=P90（合并优先）；高分位通常合并更多但等待更久"
       },
@@ -164,14 +168,14 @@
         "default": 1,
         "minimum": 0,
         "maximum": 1,
-        "hint": "非唤醒消息中图片/表情被保留的概率（仅在 image_recognition_only_on_mention=false 时生效）"
+        "hint": "非唤醒消息中图片/表情被保留的概率（仅在 image_recognition_only_on_mention=false 时生效；vlm 与 native 模式均生效）"
       },
       "max_images_per_message": {
         "name": "最多保留图片/表情数",
         "type": "integer",
         "default": 3,
         "minimum": 0,
-        "hint": "每条消息最多保留的图片+动画表情数量（超出部分替换为 [图片]）。仅在 image_recognition_only_on_mention=false 时生效"
+        "hint": "每条消息最多保留的图片+动画表情数量；超出部分不识别（vlm 空占位 / native [Image attached] 占位；按需图片工具开启时保留元素供 read_media）。仅在 image_recognition_only_on_mention=false 时生效"
       },
       "forward_recognition_only_on_mention": {
         "name": "仅唤醒消息解析转发",
@@ -227,7 +231,7 @@
         "name": "合并记录最大查看深度",
         "default": 4,
         "minimum": 1,
-        "hint": "允许 read_forward 下钻的最大层数（根为第1层），不是首轮自动展开层数"
+        "hint": "允许 read_forward 下钻的最大层数（根为第1层，内部上限 64），不是首轮自动展开层数"
       },
       "voice_recognition_only_on_mention": {
         "name": "仅唤醒消息识别语音（群聊）",
@@ -246,14 +250,14 @@
         "type": "integer",
         "default": 0,
         "minimum": 0,
-        "hint": "仅当语音时长不超过此值时才会尝试识别（0 表示不限制）。超过此秒数的语音会直接替换为 [长语音 X秒]。对缺少时长元数据的语音（如被引用的机器人自己的语音）会尽力估算时长后再判断。"
+        "hint": "仅当语音时长不超过此值时才会自动识别（0 表示不限制）。超过时：按需语音工具开启则保留元素供 read_media，关闭则替换为 [长语音 X秒]；缺少时长元数据时会尽力估算后再判断。"
       },
       "max_images_per_message_mentioned": {
         "name": "唤醒消息最多保留图片/表情数",
         "type": "integer",
         "default": 0,
         "minimum": 0,
-        "hint": "唤醒消息（@/关键词/引用）中最多保留的图片+动画表情数量，超出部分不识别（vlm 模式空占位 / native 模式 [Image attached] 占位拦直传，省 token）。默认 0 = 不限制（唤醒消息全部识别/直传）。"
+        "hint": "唤醒消息（@/关键词/引用）中最多保留的图片+动画表情数量，超出部分不识别（vlm 空占位 / native 占位拦直传；按需图片工具开启时保留元素供 read_media）。默认 0 = 不限制"
       },
       "native_sticker_follow_mention": {
         "name": "原生模式表情包跟随仅唤醒控制",
@@ -1378,6 +1382,34 @@
           "per_user",
           "all"
         ]
+      }
+    }
+  },
+  "section_ignore": {
+    "type": "section",
+    "name": "完整拉黑（all）",
+    "collapsed": true,
+    "hint": "<ignore>all / 全量拉黑（该用户/会话所有消息不再进入 LLM）的独立时长，不再借用戳一戳等单项配置",
+    "fields": {
+      "default_duration": {
+        "type": "integer",
+        "name": "默认拉黑时长（秒）",
+        "default": 180,
+        "minimum": 1,
+        "hint": "bot 不指定时长时，完整拉黑使用的默认时长"
+      },
+      "allow_bot_duration": {
+        "type": "switch",
+        "name": "允许 bot 自设时长",
+        "default": true,
+        "hint": "关闭后 bot 对完整拉黑只能使用默认时长，忽略 XML/工具里的 duration"
+      },
+      "max_duration": {
+        "type": "integer",
+        "name": "最大拉黑时长（秒）",
+        "default": 300,
+        "minimum": 0,
+        "hint": "bot 自设时长超过该值则钳制；0=不限制（仅允许自设时生效）"
       }
     }
   },

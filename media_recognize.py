@@ -440,7 +440,7 @@ class ParallelMediaRecognizer:
         """就地拍平嵌套 Forward（借鉴并行识图插件 _flatten_forwards，main.py:234-285）。
 
         KiraAI 核心 message_format_to_text 渲染 Forward 时会过滤嵌套 Forward 元素
-        （`[x for x in chain if not isinstance(x, Forward)]`，message_manager.py:371，防无限递归），
+        （`[x for x in chain if not isinstance(x, Forward)]`；3.x 在 core/workflow/src/im/message_formatter.py，2.x 在 core/message_manager.py；防无限递归），
         导致嵌套转发的内容（含图片标识符）不进 message_str，LLM 看不到。stage1 先把嵌套
         Forward 展开为平铺元素，保证嵌套内容完整渲染。
 
@@ -730,6 +730,11 @@ class ParallelMediaRecognizer:
         short_id = getattr(elem, "_pir_short_id", None) or f"noid_{id(elem)}"
         info = bucket.get(short_id)
         if not isinstance(info, dict):
+            return
+        if getattr(elem, "_media_skip", False):
+            # 语音按需工具模式：宿主已判定本次不自动识别，只保留 [Record #id]
+            # 占位给 read_media，绝不预取/STT。
+            info["_done"] = True
             return
         md5 = None
         try:
