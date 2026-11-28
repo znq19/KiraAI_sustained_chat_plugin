@@ -14,10 +14,29 @@ import re
 import time
 import weakref
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 from core.chat.message_elements import Text, Image, Sticker, Record, Reply, Forward
 from core.utils.path_utils import get_data_path
+from forward_raw import (
+    RawForward,
+    collect_nested,
+    extract_forward_descriptors,
+    first_str,
+    message_object,
+    message_payload,
+    node_meta,
+    node_segments,
+    segment_node_parts,
+    xml_res_id,
+)
+
+try:
+    from core.plugin import logger
+except ImportError:  # 测试桩或极简宿主
+    import logging
+    logger = logging.getLogger(__name__)
 
 try:
     from core.chat.message_elements import At, Emoji, File, Json, Notice, Poke, Video
@@ -48,6 +67,51 @@ MEDIA_ID_RE = re.compile(r"^[isr][0-9a-f]{8,64}$")
 FORWARD_ID_RE = re.compile(r"^f[0-9a-f]{8,64}$")
 MEDIA_ID_PATTERN = r"^[isr][0-9a-f]{8,64}$"
 FORWARD_ID_PATTERN = r"^f[0-9a-f]{8,64}$"
+
+# 原始 OneBot 转发树补全的安全边界：只用于口径异常的协议端补齐，正常路径不触发。
+RAW_FORWARD_TIMEOUT = 8.0
+RAW_FORWARD_TOTAL_BUDGET = 12.0
+RAW_FORWARD_MAX_DEPTH = 64
+RAW_FORWARD_MAX_NODES = 2000
+RAW_FORWARD_MAX_FETCHES = 32
+RAW_FORWARD_RETRY_SECONDS = 60
+RAW_MEDIA_OCCURRENCE_BASE = 1_000_000
+RAW_TRUNCATED_TEXT = {
+    "depth": "已达最大查看深度",
+    "cycle": "循环引用",
+    "fetch_failed": "内容获取失败，可重试",
+    "xml_card": "聊天记录卡片无法展开",
+}
+
+
+class _RawMessage:
+    """Minimal message stand-in for hydrating a persisted record after restart."""
+
+    def __init__(self, message_id):
+        self.message_id = message_id or "runtime"
+        self.chain = []
+        self.sender = None
+        self.group = None
+        self.extra = {}
+        self.message_str = None
+
+
+class _RawBuildContext:
+    """Per-hydration budget/cycle/created-record tracking."""
+
+    def __init__(self, manager, sid, message, root_id, message_id):
+        self.manager = manager
+        self.sid = sid
+        self.message = message if message is not None else _RawMessage(message_id)
+        self.message_id = message_id or getattr(self.message, "message_id", "runtime")
+        self.root_id = root_id
+        self.visited: set[str] = set()
+        self.active: set[str] = set()
+        self.records: dict = {}
+        self.entries: set[str] = set()
+        self.fetches = 0
+        self.nodes = 0
+        self.deadline = time.monotonic() + RAW_FORWARD_TOTAL_BUDGET
 
 
 class MediaAccessManager:
@@ -94,6 +158,9 @@ class MediaAccessManager:
         self._bg_tasks: set[asyncio.Task] = set()
         self._reading_ids: dict[str, int] = {}
         self._persisting_ids: set[str] = set()
+        # key: Forward ID；value: 正在补全原始树的后台任务。read_forward 会等待它，
+        # 但最多等 RAW_FORWARD_TIMEOUT，超时仍按已有轻量树返回，绝不阻塞消息链路。
+        self._hydrate_tasks: dict[str, asyncio.Task] = {}
         self._initialized = False
         self._last_catalog_cleanup = 0.0
         self._session_event_bus = None
@@ -328,7 +395,8 @@ class MediaAccessManager:
         return True if not self._enabled_for(kind) else self.prefetch_enabled
 
     def _register_media(self, elem, kind: str, sid: str, message,
-                        occurrence: int, nested: bool, history_occurrence=None) -> str:
+                        occurrence: int, nested: bool, history_occurrence=None,
+                        index: bool = True) -> str:
         raw_message_id = getattr(message, "message_id", None)
         message_id = raw_message_id or f"runtime-{id(message)}"
         prefix = {"Image": "i", "Sticker": "s", "Record": "r"}[kind]
@@ -352,7 +420,8 @@ class MediaAccessManager:
             elem._media_access_id = media_id
         except Exception:
             pass
-        self._index_message(self._message_entries, message, media_id)
+        if index:
+            self._index_message(self._message_entries, message, media_id)
         return media_id
 
     def prepare_message(self, message, sid: str) -> None:
@@ -363,8 +432,21 @@ class MediaAccessManager:
         counters = {"Image": 0, "Sticker": 0, "Record": 0}
         history_counters = {"Image": 0, "Sticker": 0, "Record": 0}
         forward_ids = []
+        # OneBot 原始报文里顶层 forward 段的顺序与框架链中的 Forward 元素一致；
+        # 只在顶层消费，Reply.chain 里的 Forward 由 _schedule_reply_hydration 处理。
+        raw_forwards = self._extract_raw_forwards(getattr(message, "raw_message", None))
+        top_forward_count = sum(1 for elem in (getattr(message, "chain", None) or [])
+                                if isinstance(elem, Forward))
+        # 只有「框架顶层 Forward 数 == 原始顶层 forward 段数」时才按顺序匹配；
+        # 部分段被框架丢弃时宁可不匹配，也不能把 A 的内容套到 B 上。
+        map_raw = top_forward_count == len(raw_forwards)
+        if raw_forwards and not map_raw and top_forward_count:
+            logger.debug(f"[MediaAccess] forward count mismatch: framework={top_forward_count} "
+                         f"raw={len(raw_forwards)}; skip raw mapping to avoid mixing records")
+        raw_cursor = 0
 
         def walk(chain, nested=False, path=()):
+            nonlocal raw_cursor
             for index, elem in enumerate(chain):
                 if isinstance(elem, (Image, Sticker, Record)):
                     kind = ("Sticker" if isinstance(elem, Sticker)
@@ -378,18 +460,51 @@ class MediaAccessManager:
                 elif isinstance(elem, Reply) and elem.chain is not None:
                     walk(elem.chain, nested, path + ("r", index))
                 elif isinstance(elem, Forward):
+                    raw = None
+                    # 顶层链的 path 为空；Reply.chain 递归后会带 "r" 前缀。
+                    if map_raw and not path and raw_cursor < len(raw_forwards):
+                        raw = raw_forwards[raw_cursor]
+                        raw_cursor += 1
                     forward_id = self._register_forward(
                         elem, sid, message, 1 if not nested else None,
-                        path + (index,), counters, set())
+                        path + (index,), counters, set(), raw=raw)
                     forward_ids.append(forward_id)
 
         walk(message.chain)
-        if self.forward_tool_enabled and forward_ids:
-            self._replace_forward_elements(message.chain)
+        if self.forward_tool_enabled:
+            # 回复链里的 Forward 也要补全；先捕获元素，再统一替换为预览文本。
+            self._schedule_reply_hydration(message, sid)
+            if forward_ids:
+                self._replace_forward_elements(message.chain)
+            elif (raw_forwards and top_forward_count == 0
+                  and not any(getattr(elem, "_media_forward_id", None)
+                              for elem in message.chain)
+                  and not self._message_forwards.get(id(message))):
+                # 框架整体丢了顶层 forward（NapCat 的 node 包裹就是这种情况），
+                # 由插件补一条预览，保证 LLM 仍能拿到可读取的 Forward ID。
+                for raw in raw_forwards:
+                    self._attach_raw_only_forward(message, sid, raw, counters)
         self._schedule_persistence(message)
 
+    def _attach_raw_only_forward(self, message, sid, raw, counters) -> str:
+        """Create a root Forward record when the framework dropped the element."""
+        dummy = Forward(chains=[])
+        forward_id = self._register_forward(
+            dummy, sid, message, 1, (raw.index,), counters, set(), raw=raw)
+        preview = Text(self.render_forward(forward_id, depth=1, root_summary=True))
+        preview._media_forward_id = forward_id
+        try:
+            target = message.chain.message_list
+            target.insert(min(max(raw.index, 0), len(target)), preview)
+        except AttributeError:
+            try:
+                message.chain.append(preview)
+            except Exception:
+                pass
+        return forward_id
+
     def _register_forward(self, forward: Forward, sid: str, message, depth,
-                          path, counters, visiting) -> str:
+                          path, counters, visiting, raw: RawForward | None = None) -> str:
         actual_depth = depth or 1
         raw_message_id = getattr(message, "message_id", None)
         message_id = raw_message_id or f"runtime-{id(message)}"
@@ -399,16 +514,23 @@ class MediaAccessManager:
         existing = self._forwards.get(forward_id)
         if existing is not None:
             existing["message_ref"] = self._message_ref(message)
+            if raw is not None and not existing.get("source_id"):
+                existing["source_id"] = raw.id
+                existing["source_kind"] = raw.kind
             self._index_message(self._message_forwards, message, forward_id)
             try:
                 forward._media_access_forward_id = forward_id
             except Exception:
                 pass
+            self._schedule_forward_hydration(existing, raw, sid, message)
             return forward_id
         record = {
             "id": forward_id, "depth": actual_depth, "sid": sid, "digest": digest,
             "message_id": str(message_id), "path": path_text, "children": [],
             "volatile": raw_message_id is None,
+            "source_id": raw.id if raw is not None else "",
+            "source_kind": raw.kind if raw is not None else "",
+            "hydrated": False, "retry_after": 0,
         }
         record["message_ref"] = self._message_ref(message)
         self._forwards[forward_id] = record
@@ -418,13 +540,15 @@ class MediaAccessManager:
         except Exception:
             pass
         marker = id(forward)
-        if marker in visiting or actual_depth >= 64:
+        if marker in visiting or actual_depth >= RAW_FORWARD_MAX_DEPTH:
+            self._schedule_forward_hydration(record, raw, sid, message)
             return forward_id
         visiting.add(marker)
         for index, chain in enumerate(forward.chains or []):
             record["children"].append(self._serialize_chain(
                 chain, sid, message, actual_depth, path + (index,), counters, visiting))
         visiting.discard(marker)
+        self._schedule_forward_hydration(record, raw, sid, message)
         return forward_id
 
     def _serialize_chain(self, chain, sid, message, depth, path, counters, visiting):
@@ -481,13 +605,686 @@ class MediaAccessManager:
     def _forward_id_for_element(self, target):
         return getattr(target, "_media_access_forward_id", None)
 
+    # ================= 原始 OneBot 转发树补全 =================
+    #
+    # 背景（2026-11-28 审计，KiraAI 3.3.0 / 3.4.0 的 QQ 适配器逐字未变）：
+    #   - 适配器对嵌套 forward 段使用「内层消息的 message_id」再调 get_forward_msg，
+    #     但协议端要求的是记录 resId（NapCat 明确报「内层消息无法获取」）。
+    #   - 适配器完全不看 forward 段的 data.content（NapCat/SnowLuma/LLOneBot 的内联节点），
+    #     也不看 NapCat get_forward_msg 返回的 {type:"node", data:{...}} 包裹。
+    #   - 因此 2.8.0 / 1.11.0 起「保留原树 + read_forward 下钻」在遇到嵌套时只能看到外层，
+    #     而旧版靠 _flatten_forwards 把嵌套内容拍平，所以看起来是「升级后丢了嵌套」。
+    #
+    # 修复策略不碰框架：只在插件侧按协议端原始报文补全插件自己的轻量树。
+    # 原有框架解析结果、媒体 ID、首轮预览全部保留；仅补上框架丢掉/放不下的嵌套节点。
+
+    def _extract_raw_forwards(self, raw_message) -> list:
+        if not isinstance(raw_message, dict):
+            return []
+        if isinstance(raw_message.get("message"), list):
+            return extract_forward_descriptors(raw_message)
+        data = raw_message.get("data")
+        if isinstance(data, dict) and isinstance(data.get("message"), list):
+            return extract_forward_descriptors(data)
+        return []
+
+    def _track_hydration(self, key: str, task) -> None:
+        if task is None:
+            return
+        self._hydrate_tasks[key] = task
+
+        def _done(finished, key=key):
+            if self._hydrate_tasks.get(key) is finished:
+                self._hydrate_tasks.pop(key, None)
+
+        task.add_done_callback(_done)
+
+    def _schedule_forward_hydration(self, record, raw, sid, message) -> None:
+        if not self.forward_tool_enabled or raw is None or record is None:
+            return
+        if record.get("hydrated"):
+            return
+        if not (raw.id or raw.content or raw.kind in ("node", "xml")):
+            return
+        retry_after = record.get("retry_after") or 0
+        if retry_after > time.time():
+            return
+        fid = record.get("id")
+        if not fid:
+            return
+        task = self._hydrate_tasks.get(fid)
+        if task is not None and not task.done():
+            return
+        task = self._schedule_task(self._hydrate_forward(record, raw, sid, message))
+        self._track_hydration(fid, task)
+
+    def _schedule_reply_hydration(self, message, sid) -> None:
+        for elem in list(getattr(message, "chain", []) or []):
+            if not isinstance(elem, Reply) or elem.chain is None:
+                continue
+            pairs = []
+            for forward in elem.chain:
+                if isinstance(forward, Forward):
+                    fid = getattr(forward, "_media_access_forward_id", None)
+                    if fid:
+                        pairs.append(fid)
+            if not pairs:
+                continue
+            if all((self._forwards.get(fid) or {}).get("hydrated") for fid in pairs):
+                continue
+            key = "reply:" + str(id(elem))
+            task = self._hydrate_tasks.get(key)
+            if task is not None and not task.done():
+                continue
+            task = self._schedule_task(self._hydrate_reply_forwards(elem, pairs, sid, message))
+            self._track_hydration(key, task)
+
+    async def _hydrate_reply_forwards(self, reply, pairs, sid, message) -> None:
+        client = self._client_for(sid)
+        if client is None:
+            return
+        try:
+            resp = await asyncio.wait_for(
+                self._call_get_msg(client, reply.message_id), timeout=RAW_FORWARD_TIMEOUT)
+        except Exception:
+            return
+        descs = [d for d in self._extract_raw_forwards(message_object(resp))
+                 if d.kind == "forward"]
+        if len(descs) != len(pairs):
+            return
+        for index, fid in enumerate(pairs):
+            record = self._forwards.get(fid)
+            if record is None or record.get("hydrated"):
+                continue
+            if (record.get("retry_after") or 0) > time.time():
+                continue
+            if index < len(descs):
+                await self._hydrate_forward(record, descs[index], sid, message)
+
+    async def _ensure_forward_ready(self, forward_id: str, sid=None):
+        record = await self._forward(forward_id)
+        if record is None or record.get("hydrated"):
+            return record
+        if sid and record.get("sid") != sid:
+            return record
+        if record.get("depth", 1) > min(self.forward_max_depth, RAW_FORWARD_MAX_DEPTH):
+            return record
+        if record.get("truncated") in ("depth", "cycle"):
+            return record
+        retry_after = record.get("retry_after") or 0
+        if retry_after > time.time():
+            return record
+        task = self._hydrate_tasks.get(forward_id)
+        if task is None or task.done():
+            raw = None
+            source_id = record.get("source_id")
+            if source_id:
+                raw = RawForward(id=source_id, kind=record.get("source_kind") or "forward")
+            else:
+                # 兼容升级前已落盘的旧记录：它们没有 source_id，但保留了 message_id
+                # 与顶层 path，可用 get_msg 重新取回原始报文定位 forward 段。
+                attempts = int(record.get("source_restore_attempts") or 0)
+                if attempts >= 3:
+                    return record
+                record["source_restore_attempts"] = attempts + 1
+                raw = await self._descriptor_from_message_record(record)
+                if raw is None:
+                    record["retry_after"] = time.time() + RAW_FORWARD_RETRY_SECONDS
+                    return record
+                record["source_id"] = raw.id
+                record["source_kind"] = raw.kind
+            task = self._schedule_task(self._hydrate_forward(
+                record, raw, record.get("sid"), None))
+            if task is None:
+                return record
+            self._track_hydration(forward_id, task)
+        try:
+            await asyncio.wait_for(asyncio.shield(task),
+                                   timeout=RAW_FORWARD_TOTAL_BUDGET + 3)
+        except Exception:
+            pass
+        return record
+
+    async def _descriptor_from_message_record(self, record):
+        """Rebuild a root Forward descriptor for a legacy persisted record."""
+        message_id = str(record.get("message_id") or "")
+        if not message_id or message_id.startswith("runtime-") or message_id == "None":
+            return None
+        path_text = str(record.get("path") or "0")
+        if "/" in path_text:
+            return None  # 只恢复顶层记录；嵌套记录由父记录补全
+        try:
+            index = int(path_text.split("/", 1)[0])
+        except (TypeError, ValueError):
+            return None
+        client = self._client_for(record.get("sid"))
+        if client is None:
+            return None
+        try:
+            resp = await asyncio.wait_for(
+                self._call_get_msg(client, message_id), timeout=RAW_FORWARD_TIMEOUT)
+        except Exception:
+            return None
+        descs = self._extract_raw_forwards(message_object(resp))
+        for desc in descs:
+            if desc.index == index:
+                return desc
+        # 框架链索引与原始段索引可能因丢弃元素错位；只有一个候选时仍可安全恢复。
+        return descs[0] if len(descs) == 1 else None
+
+    def _client_for(self, sid):
+        if not sid or self.ctx is None:
+            return None
+        manager = getattr(self.ctx, "adapter_mgr", None)
+        if manager is None:
+            return None
+        try:
+            adapter = manager.get_adapter(sid.split(":", 1)[0])
+        except Exception:
+            adapter = None
+        if adapter is None:
+            return None
+        getter = getattr(adapter, "get_client", None)
+        if callable(getter):
+            try:
+                client = getter()
+                if client is not None:
+                    return client
+            except Exception:
+                pass
+        return getattr(adapter, "bot", None)
+
+    async def _call_get_forward(self, client, source_id: str):
+        method = getattr(client, "get_forward_msg", None)
+        if callable(method):
+            return await method(source_id)
+        send = getattr(client, "send_action", None)
+        if callable(send):
+            return await send("get_forward_msg", {"message_id": source_id})
+        raise RuntimeError("adapter client has no get_forward_msg")
+
+    async def _call_get_msg(self, client, message_id: str):
+        method = getattr(client, "get_msg", None)
+        if callable(method):
+            return await method(message_id)
+        send = getattr(client, "send_action", None)
+        if callable(send):
+            return await send("get_msg", {"message_id": message_id})
+        raise RuntimeError("adapter client has no get_msg")
+
+    async def _fetch_forward_nodes(self, source_id: str, ctx) -> list:
+        if not source_id:
+            return []
+        if ctx.fetches >= RAW_FORWARD_MAX_FETCHES:
+            raise RuntimeError("raw forward fetch budget exhausted")
+        if time.monotonic() > ctx.deadline:
+            raise TimeoutError("raw forward hydration deadline exceeded")
+        ctx.fetches += 1
+        client = self._client_for(ctx.sid)
+        if client is None:
+            raise RuntimeError("adapter client unavailable")
+        resp = await asyncio.wait_for(
+            self._call_get_forward(client, source_id), timeout=RAW_FORWARD_TIMEOUT)
+        return message_payload(resp)
+
+    async def _raw_nodes_for(self, raw: RawForward, ctx) -> list | None:
+        if raw.content:
+            content = raw.content
+            if content and all(isinstance(x, str) for x in content):
+                return [{"message": [{"type": "text", "text": x}]} for x in content]
+            if content and all(isinstance(x, dict) for x in content):
+                node_like = any(
+                    ("sender" in x) or ("message" in x) or ("content" in x)
+                    or ("user_id" in x) or ("nickname" in x)
+                    for x in content)
+                if not node_like:
+                    return [{"message": content}]
+            return content
+        if raw.kind == "node":
+            kind, payload = segment_node_parts(raw.data)
+            if kind == "nodes":
+                return payload
+            if kind == "segments":
+                meta = node_meta(raw.data)
+                return [{
+                    "sender": {"nickname": meta["name"], "user_id": meta["uid"]},
+                    "time": meta["time"], "message": payload,
+                }]
+            if raw.id:
+                return await self._fetch_forward_nodes(raw.id, ctx)
+            return []
+        if raw.kind == "xml":
+            resid = raw.id or xml_res_id(raw.data)
+            if resid:
+                return await self._fetch_forward_nodes(resid, ctx)
+            return []
+        if raw.id:
+            return await self._fetch_forward_nodes(raw.id, ctx)
+        return None
+
+    async def _hydrate_forward(self, record, raw: RawForward, sid, message) -> None:
+        if record.get("depth", 1) > min(self.forward_max_depth, RAW_FORWARD_MAX_DEPTH):
+            record["truncated"] = "depth"
+            record["hydrated"] = True
+            return
+        if raw.kind == "xml" and not (raw.id or xml_res_id(raw.data)):
+            record["truncated"] = "xml_card"
+            record["hydrated"] = True
+            return
+        ctx = _RawBuildContext(self, sid, message, record["id"], record.get("message_id"))
+        if raw.id:
+            ctx.visited.add(raw.id)
+        try:
+            nodes = await self._raw_nodes_for(raw, ctx)
+            if nodes is None:
+                return
+            ctx.active.add(record["id"])
+            try:
+                record["children"] = await self._merge_raw_nodes(record, nodes, ctx)
+            finally:
+                ctx.active.discard(record["id"])
+            record["hydrated"] = True
+            record["truncated"] = ""
+            record["source_id"] = raw.id or record.get("source_id", "")
+            record["source_kind"] = raw.kind
+            record.pop("hydration_error", None)
+            record.pop("retry_after", None)
+            record.pop("source_restore_attempts", None)
+            self._refresh_forward_preview(record, message)
+            # 根记录必须落盘：纯文本补全不会有子记录/媒体，但 children 已经变化。
+            await self._persist_message(
+                sorted(ctx.entries), list(ctx.records) + [record["id"]])
+            self._trim_runtime()
+        except Exception as exc:
+            record["hydration_error"] = f"{type(exc).__name__}: {exc}"
+            if raw.kind == "xml":
+                record["truncated"] = "xml_card"
+            elif not record.get("children") and not record.get("truncated"):
+                record["truncated"] = "fetch_failed"
+            record["retry_after"] = time.time() + RAW_FORWARD_RETRY_SECONDS
+            logger.debug(f"[MediaAccess] raw forward hydration failed for "
+                         f"{record.get('id')}: {type(exc).__name__}: {exc}")
+
+    async def _merge_raw_nodes(self, record, nodes, ctx) -> list:
+        existing = record.get("children") or []
+        if not existing:
+            return await self._build_raw_children(
+                nodes, record.get("depth", 1), (record["id"],), ctx)
+        for index, node in enumerate(nodes):
+            if index >= len(existing):
+                # 原始报文比框架多出的条目只追加，不重建已有链，避免丢框架媒体条目。
+                if ctx.nodes >= RAW_FORWARD_MAX_NODES:
+                    existing.append([{"type": "text", "text": "[合并记录过长，已截断]"}])
+                    break
+                ctx.nodes += 1
+                existing.append(await self._serialize_raw_node(
+                    node, ctx, record.get("depth", 1), (record["id"], index)))
+                continue
+            chain = existing[index]
+            if not isinstance(chain, list):
+                continue
+            if not chain:
+                if ctx.nodes >= RAW_FORWARD_MAX_NODES:
+                    existing[index] = [{"type": "text", "text": "[合并记录过长，已截断]"}]
+                    continue
+                ctx.nodes += 1
+                existing[index] = await self._serialize_raw_node(
+                    node, ctx, record.get("depth", 1), (record["id"], index))
+                continue
+            descs = collect_nested(node_segments(node))
+            forward_elements = [e for e in chain if e.get("type") == "forward"]
+            forward_descs = [d for d in descs if d.kind == "forward"]
+            extra_descs = [d for d in descs if d.kind != "forward"]
+            for sub, desc in enumerate(forward_descs):
+                if sub < len(forward_elements):
+                    child = self._forwards.get(forward_elements[sub].get("forward_id"))
+                    if (child is not None and not child.get("hydrated")
+                            and (child.get("retry_after") or 0) <= time.time()):
+                        await self._hydrate_child_record(child, desc, ctx)
+                else:
+                    chain.extend(await self._make_nested_forward(
+                        desc, ctx, record.get("depth", 1),
+                        (record["id"], index, "f", sub)))
+            for sub, desc in enumerate(extra_descs):
+                chain.extend(await self._make_nested_forward(
+                    desc, ctx, record.get("depth", 1),
+                    (record["id"], index, "x", sub)))
+        return existing
+
+    async def _hydrate_child_record(self, record, raw: RawForward, ctx) -> None:
+        if record.get("depth", 1) > min(self.forward_max_depth, RAW_FORWARD_MAX_DEPTH):
+            record["truncated"] = "depth"
+            record["hydrated"] = True
+            ctx.records[record["id"]] = record
+            return
+        if record["id"] in ctx.active:
+            record["truncated"] = "cycle"
+            record["hydrated"] = True
+            ctx.records[record["id"]] = record
+            return
+        try:
+            nodes = await self._raw_nodes_for(raw, ctx)
+            if nodes is None:
+                return
+            ctx.active.add(record["id"])
+            try:
+                if record.get("children"):
+                    record["children"] = await self._merge_raw_nodes(record, nodes, ctx)
+                else:
+                    record["children"] = await self._build_raw_children(
+                        nodes, record.get("depth", 1), (record["id"],), ctx)
+            finally:
+                ctx.active.discard(record["id"])
+            record["hydrated"] = True
+            record["truncated"] = ""
+            record["source_id"] = raw.id or record.get("source_id", "")
+            record["source_kind"] = raw.kind
+            ctx.records[record["id"]] = record
+        except Exception:
+            record["truncated"] = "fetch_failed"
+            record["hydrated"] = False
+            record["retry_after"] = time.time() + RAW_FORWARD_RETRY_SECONDS
+            ctx.records[record["id"]] = record
+
+    async def _build_raw_children(self, nodes, depth, path, ctx) -> list:
+        children = []
+        for index, node in enumerate(nodes or []):
+            if ctx.nodes >= RAW_FORWARD_MAX_NODES:
+                children.append([{"type": "text", "text": "[合并记录过长，已截断]"}])
+                break
+            ctx.nodes += 1
+            children.append(await self._serialize_raw_node(
+                node, ctx, depth, tuple(path) + (index,)))
+        return children
+
+    async def _serialize_raw_node(self, node, ctx, depth, path) -> list:
+        meta = node_meta(node)
+        segments = node_segments(node)
+        chain = [{"type": "text",
+                  "text": f"[{self._format_raw_time(meta['time'])}] {self._clean_name(meta['name'])}: "}]
+        for index, seg in enumerate(segments):
+            chain.extend(await self._serialize_raw_segment(
+                seg, ctx, depth, tuple(path) + (index,)))
+        if not segments:
+            chain.append({"type": "text", "text": "[空消息]"})
+        return chain
+
+    async def _serialize_raw_segment(self, seg, ctx, depth, path) -> list:
+        if not isinstance(seg, dict):
+            return [{"type": "text", "text": str(seg)}] if seg else []
+        kind = seg.get("type")
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        if kind == "text":
+            text = data.get("text", "")
+            return [{"type": "text", "text": str(text)}] if text else []
+        if kind == "image":
+            url = self._raw_media_source(data)
+            sticker = data.get("sub_type") == 1 or data.get("summary") == "[动画表情]"
+            if not url:
+                return [{"type": "text", "text": "[动画表情]" if sticker else "[图片]"}]
+            try:
+                elem = Sticker(sticker=url) if sticker else Image(url)
+            except Exception:
+                return [{"type": "text", "text": "[动画表情]" if sticker else "[图片]"}]
+            media_id = self._register_raw_media(
+                elem, "Sticker" if sticker else "Image", ctx, path)
+            return [{"type": "media", "media_id": media_id,
+                     "kind": "Sticker" if sticker else "Image"}]
+        if kind == "record":
+            url = self._raw_media_source(data)
+            if not url:
+                return [{"type": "text", "text": "[语音]"}]
+            try:
+                elem = Record(url)
+            except Exception:
+                return [{"type": "text", "text": "[语音]"}]
+            media_id = self._register_raw_media(elem, "Record", ctx, path)
+            return [{"type": "media", "media_id": media_id, "kind": "Record"}]
+        if kind == "video":
+            name = first_str(data.get("file"), data.get("name"), "视频")
+            return [{"type": "file", "name": name}]
+        if kind == "file":
+            return [{"type": "file", "name": first_str(data.get("name"), data.get("file"), "文件")}]
+        if kind == "at":
+            target = first_str(data.get("qq"), data.get("user_id"))
+            nickname = "全体成员" if target == "all" else first_str(
+                data.get("name"), data.get("nickname"))
+            return [{"type": "at", "pid": target, "nickname": nickname}]
+        if kind in ("face", "emoji"):
+            return [{"type": "emoji", "emoji_id": first_str(data.get("id")),
+                     "emoji_desc": first_str(data.get("desc"), data.get("summary"))}]
+        if kind == "reply":
+            return [{"type": "reply", "message_id": first_str(data.get("id")),
+                     "message_content": first_str(
+                         data.get("content"), data.get("message_content")), "chain": []}]
+        if kind == "json":
+            return [{"type": "json", "text": self._raw_card_text(data)}]
+        if kind == "xml":
+            desc = collect_nested([seg])
+            if desc and desc[0].kind == "xml":
+                return await self._make_nested_forward(desc[0], ctx, depth, tuple(path) + ("xml",))
+            return [{"type": "text", "text": "[XML消息]"}]
+        if kind == "forward":
+            desc = collect_nested([seg])
+            if desc:
+                return await self._make_nested_forward(desc[0], ctx, depth, tuple(path) + ("f",))
+            return [{"type": "text", "text": "[空合并记录]"}]
+        if kind == "node":
+            node_kind, _payload = segment_node_parts(data)
+            if node_kind == "empty":
+                if first_str(data.get("id")):
+                    desc = RawForward(kind="node", id=first_str(data.get("id")), data=data)
+                    return await self._make_nested_forward(
+                        desc, ctx, depth, tuple(path) + ("n",))
+                return [{"type": "text", "text": "[空消息]"}]
+            # 合并记录内部出现的 node 段就是协议端的嵌套记录边界（NapCat 的
+            # get_forward_msg 会把嵌套 forward 递归成 node.data.message）。
+            desc = RawForward(kind="node", data=data)
+            return await self._make_nested_forward(desc, ctx, depth, tuple(path) + ("n",))
+        if kind in ("markdown",):
+            return [{"type": "text", "text": first_str(data.get("content"), data.get("text"), "[Markdown]")}]
+        if kind == "poke":
+            return [{"type": "text", "text": "[戳一戳]"}]
+        return [{"type": "text", "text": f"[{kind or '未知消息'}]"}]
+
+    async def _make_nested_forward(self, desc: RawForward, ctx, parent_depth, path) -> list:
+        depth = parent_depth + 1
+        truncated = ""
+        nodes = None
+        if depth > min(self.forward_max_depth, RAW_FORWARD_MAX_DEPTH):
+            truncated = "depth"
+        elif desc.kind == "forward":
+            if desc.content:
+                nodes = desc.content
+            elif desc.id:
+                if desc.id in ctx.visited:
+                    truncated = "cycle"
+                else:
+                    ctx.visited.add(desc.id)
+                    try:
+                        nodes = await self._fetch_forward_nodes(desc.id, ctx)
+                    except Exception:
+                        truncated = "fetch_failed"
+                    finally:
+                        ctx.visited.discard(desc.id)
+            else:
+                return [{"type": "text", "text": "[空合并记录]"}]
+        elif desc.kind == "node":
+            node_kind, payload = segment_node_parts(desc.data)
+            if node_kind == "nodes":
+                nodes = payload
+            elif node_kind == "segments":
+                meta = node_meta(desc.data)
+                nodes = [{"sender": {"nickname": meta["name"], "user_id": meta["uid"]},
+                          "time": meta["time"], "message": payload}]
+            elif desc.id and desc.id not in ctx.visited:
+                ctx.visited.add(desc.id)
+                try:
+                    nodes = await self._fetch_forward_nodes(desc.id, ctx)
+                except Exception:
+                    truncated = "fetch_failed"
+                finally:
+                    ctx.visited.discard(desc.id)
+            elif desc.id:
+                truncated = "cycle"
+            else:
+                nodes = []
+        elif desc.kind == "xml":
+            resid = desc.id or xml_res_id(desc.data)
+            if resid and resid not in ctx.visited:
+                ctx.visited.add(resid)
+                try:
+                    nodes = await self._fetch_forward_nodes(resid, ctx)
+                except Exception:
+                    truncated = "xml_card"
+                finally:
+                    ctx.visited.discard(resid)
+            else:
+                truncated = "xml_card"
+            if not nodes and not truncated:
+                truncated = "xml_card"
+        if nodes is None:
+            nodes = []
+        record = self._new_raw_forward_record(ctx, depth, path, desc, truncated)
+        if nodes and not record.get("children"):
+            try:
+                record["children"] = await self._build_raw_children(nodes, depth, path, ctx)
+                record["truncated"] = ""
+                record["hydrated"] = True
+            except Exception:
+                record["truncated"] = "fetch_failed"
+                record["hydrated"] = False
+        return [{"type": "forward", "forward_id": record["id"]}]
+
+    def _new_raw_forward_record(self, ctx, depth, path, desc: RawForward, truncated: str = "") -> dict:
+        path_text = "/".join(map(str, path))
+        source_id = desc.id or ""
+        digest = self._digest(ctx.sid, ctx.root_id, "raw-forward", path_text, source_id)
+        forward_id = self._allocate_id("f", digest, ctx.sid, "forward")
+        record = self._forwards.get(forward_id)
+        if record is None:
+            record = {
+                "id": forward_id, "depth": depth, "sid": ctx.sid, "digest": digest,
+                "message_id": str(ctx.message_id or "runtime"),
+                "path": path_text, "children": [],
+                "volatile": ctx.message_id is None,
+            }
+            self._forwards[forward_id] = record
+        record.update({
+            "depth": depth, "sid": ctx.sid, "digest": digest, "path": path_text,
+            "source_id": source_id, "source_kind": desc.kind,
+            "truncated": truncated,
+            "hydrated": truncated not in ("fetch_failed", "xml_card"),
+        })
+        if truncated in ("fetch_failed", "xml_card"):
+            record["retry_after"] = 0
+        record.setdefault("children", [])
+        if not isinstance(ctx.message, _RawMessage):
+            self._index_message(self._message_forwards, ctx.message, forward_id)
+        ctx.records[forward_id] = record
+        return record
+
+    def _register_raw_media(self, elem, kind, ctx, path) -> str:
+        key = "/".join(map(str, path)) + "|" + kind
+        occurrence = RAW_MEDIA_OCCURRENCE_BASE + (
+            int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:10], 16) % 100_000_000)
+        media_id = self._register_media(
+            elem, kind, ctx.sid, ctx.message, occurrence, True,
+            index=not isinstance(ctx.message, _RawMessage))
+        ctx.entries.add(media_id)
+        return media_id
+
+    @staticmethod
+    def _raw_media_source(data: dict) -> str:
+        for key in ("url", "file", "uri", "path"):
+            value = data.get(key)
+            # 只接受网络/内联数据；不接受 file:/// 或裸路径，避免原始报文
+            # 把本地文件带进 read_media。
+            if isinstance(value, str) and value.startswith(
+                    ("http://", "https://", "data:", "base64://")):
+                return value
+        return ""
+
+    @staticmethod
+    def _raw_card_text(data: dict) -> str:
+        raw = data.get("data", data.get("content", ""))
+        if isinstance(raw, str):
+            try:
+                card = json.loads(raw)
+            except (TypeError, ValueError):
+                return "[卡片消息]"
+            meta = card.get("meta") if isinstance(card, dict) else None
+            if isinstance(meta, dict):
+                for value in meta.values():
+                    if isinstance(value, dict):
+                        title = first_str(value.get("title"), value.get("desc"))
+                        if title:
+                            title = re.sub(r"\s+", " ", title).strip()
+                            return f"[卡片 {title[:80]}]"
+        return "[卡片消息]"
+
+    @staticmethod
+    def _format_raw_time(value) -> str:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return "时间未知"
+        if timestamp <= 0:
+            return "时间未知"
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            return "时间未知"
+
+    @staticmethod
+    def _clean_name(value) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = text.replace("[", "［").replace("]", "］").replace(":", "：")
+        return text or "未知"
+
+    def _refresh_forward_preview(self, record, message) -> None:
+        if message is None:
+            return
+        forward_id = record.get("id")
+        new_text = self.render_forward(forward_id, depth=1, root_summary=True)
+        for elem in self._iter_texts(getattr(message, "chain", None)):
+            if getattr(elem, "_media_forward_id", None) != forward_id:
+                continue
+            old_text = getattr(elem, "text", "")
+            elem.text = new_text
+            current = getattr(message, "message_str", None)
+            if current and old_text in current:
+                message.message_str = current.replace(old_text, new_text, 1)
+
+    @staticmethod
+    def _iter_texts(chain, visiting=None):
+        if chain is None:
+            return
+        visiting = set() if visiting is None else visiting
+        identity = id(chain)
+        if identity in visiting:
+            return
+        visiting.add(identity)
+        try:
+            elements = chain.message_list
+        except AttributeError:
+            elements = chain
+        for elem in list(elements or []):
+            if isinstance(elem, Reply) and elem.chain is not None:
+                yield from MediaAccessManager._iter_texts(elem.chain, visiting)
+            elif isinstance(elem, Text):
+                yield elem
+
     def _schedule_task(self, coro):
         try:
             task = asyncio.create_task(coro)
         except RuntimeError:
-            return
+            return None
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     def _schedule_persistence(self, message) -> None:
         ids = list(self._message_entries.get(id(message), []))
@@ -855,10 +1652,16 @@ class MediaAccessManager:
                 if child is None:
                     lines.append(indent + f"[Forward #{forward_id}，不可恢复]")
                     continue
+                trunc_note = RAW_TRUNCATED_TEXT.get(child.get("truncated") or "", "")
+                if trunc_note and not child.get("children"):
+                    lines.append(indent + prefix + f"[Forward #{forward_id}｜{trunc_note}]")
+                    continue
                 actual_remaining = self._forward_remaining_depth(child)
                 remaining = min(actual_remaining,
                                 max(0, self.forward_max_depth - child.get("depth", 1)))
                 depth_note = "｜已达最大查看深度" if actual_remaining > remaining else ""
+                if trunc_note:
+                    depth_note += f"｜{trunc_note}"
                 lines.append(indent + prefix + f"[Forward #{forward_id}｜本层{len(child.get('children', []))}条｜还可下钻{remaining}层{depth_note}]")
                 # Every nested block uses the same direct-child preview format.
                 if depth > 1 and forward_id not in visiting:
@@ -900,6 +1703,9 @@ class MediaAccessManager:
         record = self._forwards.get(forward_id)
         if record is None:
             return f"合并记录 {forward_id} 不存在或已过期"
+        note = RAW_TRUNCATED_TEXT.get(record.get("truncated") or "", "")
+        if note and not record.get("children"):
+            return f"[Forward #{forward_id}｜{note}]"
         try:
             depth = int(depth)
         except (TypeError, ValueError):
@@ -915,9 +1721,15 @@ class MediaAccessManager:
         count = len(record.get("children", []))
         total = self._forward_total_nodes(record)
         if root_summary:
-            header = f"[Forward #{forward_id}｜外层{count}条｜可用 read_forward(\"{forward_id}\") 查看]"
+            if count or record.get("hydrated"):
+                header = f"[Forward #{forward_id}｜外层{count}条｜可用 read_forward(\"{forward_id}\") 查看]"
+            else:
+                # 框架整体丢弃（如 NapCat 的 node 包裹）且补全尚未完成时，
+                # 不要显示误导性的「外层0条」；ID 仍然可用。
+                header = f"[Forward #{forward_id}｜可用 read_forward(\"{forward_id}\") 查看]"
         else:
-            header = f"[Forward #{forward_id}｜本层{count}条｜还可下钻{remaining}层｜子树{total}节点]"
+            suffix = f"｜{note}" if note else ""
+            header = f"[Forward #{forward_id}｜本层{count}条｜还可下钻{remaining}层｜子树{total}节点{suffix}]"
         lines, _ = self._render_children(record, depth, "", {forward_id}, root_summary)
         all_lines = [header, *lines]
         # Line-based pagination preserves every selected node without splitting a line.
@@ -1274,6 +2086,13 @@ class MediaAccessManager:
             return ToolResult(
                 text=f"batch_limit：一次最多读取 {self.MAX_BATCH_FORWARDS} 个去重后的 Forward；本次 {len(ids)} 个，未执行任何读取")
 
+        # 首次读取时等待原始树补全；补全失败/超时仍按现有轻量树返回，不阻塞工具。
+        valid_ids = [fid for fid in ids if FORWARD_ID_RE.fullmatch(fid)]
+        if valid_ids:
+            await asyncio.gather(*(
+                self._ensure_forward_ready(fid, getattr(event, "sid", None))
+                for fid in valid_ids))
+
         current = cursor
         if isinstance(current, str) and current.strip().startswith("{"):
             try:
@@ -1338,6 +2157,9 @@ class MediaAccessManager:
                 pass
             self._session_event_bus = None
         self._initialized = False
+        for task in list(self._hydrate_tasks.values()):
+            task.cancel()
+        self._hydrate_tasks.clear()
         tasks = list(self._bg_tasks)
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=3.0)

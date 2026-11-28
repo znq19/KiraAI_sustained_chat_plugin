@@ -227,7 +227,7 @@
         "name": "合并记录最大查看深度",
         "default": 4,
         "minimum": 1,
-        "hint": "允许 read_forward 下钻的最大层数（根为第1层），不是首轮自动展开层数"
+        "hint": "允许 read_forward 下钻的最大层数（根为第1层，内部上限 64），不是首轮自动展开层数"
       },
       "voice_recognition_only_on_mention": {
         "name": "仅唤醒消息识别语音（群聊）",

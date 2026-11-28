@@ -15,6 +15,7 @@ SUITES = ["test_logger_level_guard.py", "test_guard_await.py", "test_guard_known
           "test_foreign_event.py", "test_queue_timing.py", "test_adaptive_merge.py", "test_adaptive_queue.py",
           "test_adaptive_integration.py", "test_media_access.py", "test_media_lifecycle.py", "test_media_tool_pipeline.py",
           "test_media_fixes.py", "test_empty_stop.py", "test_debounce_arrival_race.py",
+          "test_forward_raw.py",
           "test_wake_survives_empty_stop.py", "test_jev_decisions.py", "test_guard_sticker_bypass.py",
           "test_scenario_e2e.py", "test_rc1_compat.py", "test_mute_notice_perception.py", "test_poke_actor.py",
           "test_history_speaker_format.py"]

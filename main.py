@@ -23,7 +23,7 @@ if _PLUGIN_DIR not in sys.path:
 # 热重载只重新 import main.py，sys.modules 里缓存的同目录模块不会更新；
 # 强制重载，避免改了 queue_merge / media_recognize / chat_enhance 后热重载不生效（AttributeError 等）
 import importlib
-for _m in ("adaptive_merge", "media_access", "queue_merge", "media_recognize", "chat_enhance", "jev"):
+for _m in ("adaptive_merge", "forward_raw", "media_access", "queue_merge", "media_recognize", "chat_enhance", "jev"):
     if _m in sys.modules:
         try:
             importlib.reload(sys.modules[_m])
