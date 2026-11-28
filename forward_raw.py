@@ -16,6 +16,7 @@ dependency on the plugin classes, so it can be unit-tested in isolation.
 """
 from __future__ import annotations
 
+import html
 import json
 import re
 from dataclasses import dataclass, field
@@ -158,6 +159,9 @@ def extract_forward_descriptors(raw_message) -> list[RawForward]:
         elif seg.get("type") == "xml" and is_forward_card(data):
             result.append(RawForward(
                 kind="xml", id=xml_res_id(data), data=data, index=index))
+        elif seg.get("type") == "json" and is_json_forward_card(data):
+            result.append(RawForward(
+                kind="json", id=json_forward_id(data), data=data, index=index))
     return result
 
 
@@ -181,6 +185,8 @@ def collect_nested(segments) -> list[RawForward]:
             result.append(RawForward(kind="node", id=first_str(data.get("id")), data=data, index=index))
         elif kind == "xml" and is_forward_card(data):
             result.append(RawForward(kind="xml", id=xml_res_id(data), data=data, index=index))
+        elif kind == "json" and is_json_forward_card(data):
+            result.append(RawForward(kind="json", id=json_forward_id(data), data=data, index=index))
     return result
 
 
@@ -189,11 +195,49 @@ def is_forward_card(data: dict) -> bool:
     return bool(xml) and ("viewmultimsg" in xml.lower() or "聊天记录" in xml)
 
 
+def _json_card(data: dict):
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("data", data.get("content", data.get("json", "")))
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def is_json_forward_card(data: dict) -> bool:
+    card = _json_card(data)
+    if not isinstance(card, dict):
+        return False
+    app = str(card.get("app", "")).lower()
+    meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
+    detail = meta.get("detail") if isinstance(meta.get("detail"), dict) else {}
+    return "multimsg" in app or bool(detail.get("resid") or detail.get("residStr"))
+
+
+def json_forward_id(data: dict) -> str:
+    card = _json_card(data)
+    if not isinstance(card, dict):
+        return ""
+    meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
+    detail = meta.get("detail") if isinstance(meta.get("detail"), dict) else {}
+    return first_str(detail.get("resid"), detail.get("residStr"),
+                     detail.get("uniseq"), card.get("resid"))
+
+
 def xml_text(data: dict) -> str:
     if not isinstance(data, dict):
         return ""
     value = data.get("data", data.get("xml", data.get("content", "")))
-    return value if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        return ""
+    # QQ/SnowLuma may hand back entity-escaped or JSON-escaped XML.
+    return html.unescape(value).replace('\\"', '"')
 
 
 _XML_RESID_RE = re.compile(r"""m_resid\s*=\s*["']([^"']+)["']""", re.I)
@@ -208,6 +252,26 @@ def xml_res_id(data: dict) -> str:
         return ""
     match = _XML_RESID_RE.search(xml) or _XML_FILENAME_RE.search(xml)
     return first_str(match.group(1) if match else "")
+
+
+def card_ids(data: dict) -> list:
+    """All plausible record IDs carried by XML/LightApp forward cards.
+
+    SnowLuma sometimes leaves m_resid empty while m_fileName carries the key,
+    and vice versa; try both instead of committing to one.
+    """
+    ids = []
+    xml = xml_text(data)
+    if xml:
+        for pattern in (_XML_RESID_RE, _XML_FILENAME_RE):
+            for match in pattern.finditer(xml):
+                value = first_str(match.group(1))
+                if value and value not in ids:
+                    ids.append(value)
+    value = json_forward_id(data)
+    if value and value not in ids:
+        ids.append(value)
+    return ids
 
 
 def xml_brief(data: dict) -> str:
