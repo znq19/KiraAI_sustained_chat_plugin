@@ -600,6 +600,20 @@ class ParallelMediaRecognizer:
         结果池与占位文本；未命中保持待识别，stage2 照常接力 STT）。占位必须先于
         批次渲染存在，否则框架会对 Record 元素自动 STT（串行、无限流、无缓存）。
         """
+        long_voice = getattr(elem, "_long_voice_seconds", None)
+        if long_voice is not None:
+            # 超长语音：只保留 [长语音 X秒] 占位，stage1 只落盘取 file_path，绝不 STT。
+            short_id = f"long_voice_{id(elem)}"
+            try:
+                elem._pir_short_id = short_id
+            except Exception:
+                pass
+            info = {"md5": None, "elem": elem, "type": "Record", "_done": False,
+                    "long_voice": True, "long_voice_seconds": int(long_voice)}
+            txt = Text(f"[长语音 {int(long_voice)}秒]")
+            info["text_elem"] = txt
+            media[short_id] = info
+            return txt
         short_id = f"noid_{id(elem)}"
         try:
             elem._pir_short_id = short_id   # 与 _prefill_media 同约定：把键钉在元素上
@@ -730,6 +744,26 @@ class ParallelMediaRecognizer:
         short_id = getattr(elem, "_pir_short_id", None) or f"noid_{id(elem)}"
         info = bucket.get(short_id)
         if not isinstance(info, dict):
+            return
+        if info.get("long_voice"):
+            # 超长语音：只落盘拿路径，绝不进入 STT。stage1 在批次前收尾，
+            # 占位文本可直接更新；失败则保持 [长语音 X秒]。
+            try:
+                await self._persist_media(elem)
+            except Exception:
+                pass
+            p = ""
+            try:
+                p = await self._media_path(elem) or ""
+            except Exception:
+                p = ""
+            info["path"] = p
+            info["_done"] = True
+            txt = info.get("text_elem")
+            sec = info.get("long_voice_seconds")
+            if txt is not None:
+                txt.text = (f"[长语音 {sec}秒, file_path: {p}]" if p
+                            else f"[长语音 {sec}秒]")
             return
         if getattr(elem, "_media_skip", False):
             # 语音按需工具模式：宿主已判定本次不自动识别，只保留 [Record #id]
@@ -887,6 +921,23 @@ class ParallelMediaRecognizer:
             _reg = [t for t in _reg if t is not None and not t.done()]
             if _reg:
                 await asyncio.gather(*_reg, return_exceptions=True)
+            # 超长语音：stage1 只落盘拿路径，这里把 message_str 的占位更新为带路径版本。
+            # 不进 stage2/STT；没有路径就保持 [长语音 X秒]。
+            for _msg in event.messages:
+                for _info in (getattr(_msg, "_pir_media", None) or {}).values():
+                    if not isinstance(_info, dict) or not _info.get("long_voice"):
+                        continue
+                    _sec = _info.get("long_voice_seconds")
+                    _p = _info.get("path") or ""
+                    _txt = _info.get("text_elem")
+                    _new = (f"[长语音 {_sec}秒, file_path: {_p}]" if _p
+                            else f"[长语音 {_sec}秒]")
+                    if _txt is not None:
+                        _txt.text = _new
+                    _cur = getattr(_msg, "message_str", None)
+                    _old = f"[长语音 {_sec}秒]"
+                    if _cur and _old in _cur and _old != _new:
+                        _msg.message_str = _cur.replace(_old, _new, 1)
             tasks = []  # [(message, media)]
             for message in event.messages:
                 media = getattr(message, self._media_attr, None)
@@ -927,6 +978,7 @@ class ParallelMediaRecognizer:
             pending_tasks = [
                 (message, {k: v for k, v in media.items()
                            if not self._has_desc(sess_sid, k)
+                           and not v.get("long_voice")
                            and not getattr(v.get("elem"), "_media_tool_lazy", False)})
                 for message, media in tasks
             ]
@@ -1142,7 +1194,7 @@ class ParallelMediaRecognizer:
                 # 被显式判定不识别的媒体（仅唤醒识别的非唤醒媒体 / 概率未中 / 超上限）
                 # 不在这里 —— 那是配置要求的省 VLM，预取它等于绕过用户的开关。
                 for k, v in (getattr(m, "_pir_media", None) or {}).items():
-                    if not isinstance(v, dict) or v.get("_done"):
+                    if not isinstance(v, dict) or v.get("_done") or v.get("long_voice"):
                         continue
                     if not self.access.allows_prefetch(str(v.get("type", ""))):
                         continue

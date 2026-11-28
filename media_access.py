@@ -449,6 +449,9 @@ class MediaAccessManager:
             nonlocal raw_cursor
             for index, elem in enumerate(chain):
                 if isinstance(elem, (Image, Sticker, Record)):
+                    if getattr(elem, "_long_voice_seconds", None) is not None:
+                        # 超长语音只做 [长语音] 占位，不生成媒体 ID，也不允许 read_media。
+                        continue
                     kind = ("Sticker" if isinstance(elem, Sticker)
                             else "Image" if isinstance(elem, Image) else "Record")
                     occurrence = counters[kind]
@@ -1764,6 +1767,8 @@ class MediaAccessManager:
                 entry = self._entries.get(media_id)
                 if not entry or entry.get("nested") or not self._enabled_for(entry["kind"]):
                     continue
+                if getattr(entry.get("elem"), "_long_voice_seconds", None) is not None:
+                    continue
                 elem = entry.get("elem")
                 if elem is None:
                     continue
@@ -1811,6 +1816,8 @@ class MediaAccessManager:
         for media_id in self._message_entries.get(id(message), []):
             entry = self._entries.get(media_id)
             if not entry or entry.get("nested"):
+                continue
+            if getattr(entry.get("elem"), "_long_voice_seconds", None) is not None:
                 continue
             elem = entry.get("elem")
             if elem is None or not getattr(elem, "_media_tool_lazy", False):
@@ -1942,6 +1949,9 @@ class MediaAccessManager:
                     return media_id, None, (
                         f"[Media #{media_id}: not_found；当前会话未找到该 ID。"
                         "可能是复制错误、旧摘要或目录已清理；未执行媒体读取]"), True
+                if getattr(entry.get("elem"), "_long_voice_seconds", None) is not None:
+                    return media_id, None, (
+                        f"[Record #{media_id}: not_available；长语音仅占位，不提供按需识别]"), False
                 kind = entry["kind"]
                 if not self._enabled_for(kind):
                     return media_id, None, f"[{kind} #{media_id}: disabled；该类媒体的按需读取未开启]", False

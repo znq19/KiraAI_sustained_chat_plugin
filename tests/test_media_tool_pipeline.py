@@ -1,6 +1,7 @@
 """Host-level media tool presentation and lazy VLM pipeline tests."""
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 
 from test_adaptive_integration import config
@@ -133,33 +134,46 @@ async def run(plugin_dir: Path):
     check("按需语音：read_media 可读", "语音内容" in voice_result.text, voice_result.text)
     await shutdown(plug)
 
-    # 超长语音：工具开启时保留可读，关闭时维持 [长语音] 占位
+    # 超长语音：无论语音工具开关，始终 [长语音 X秒] 占位；只补路径，不 STT/不可读
     from test_debounce_arrival_race import FakeRecord as _FR
-    context = Ctx({"bot_config.capabilities.image_recognition.mode": "vlm_description"})
-    cfg = plugin_config(tool=False)
-    cfg["section_media"]["media_tool_audio_enabled"] = True
-    cfg["section_media"]["voice_max_duration"] = 10
-    plug = mod.DebouncePlugin(context, cfg)
-    rec = _FR(); rec.duration = 999
-    chain = MessageChain([rec])
-    await plug._process_record(rec, chain, 0, False, False)
-    check("超长语音+工具：保留可读元素",
-          isinstance(chain[0], type(rec)) and getattr(chain[0], "_media_skip_reason", "") == "duration",
-          type(chain[0]).__name__)
-    await shutdown(plug)
-
-    context = Ctx({"bot_config.capabilities.image_recognition.mode": "vlm_description"})
-    cfg = plugin_config(tool=False)
-    cfg["section_media"]["media_tool_audio_enabled"] = False
-    cfg["section_media"]["voice_max_duration"] = 10
-    plug = mod.DebouncePlugin(context, cfg)
-    rec = _FR(); rec.duration = 999
-    chain = MessageChain([rec])
-    await plug._process_record(rec, chain, 0, False, False)
-    check("超长语音+工具关闭：占位",
-          isinstance(chain[0], Text) and "[长语音" in chain[0].text,
-          type(chain[0]).__name__)
-    await shutdown(plug)
+    for voice_tool in (True, False):
+        context = Ctx({"bot_config.capabilities.image_recognition.mode": "vlm_description"})
+        cfg = plugin_config(tool=False)
+        cfg["section_media"]["media_tool_audio_enabled"] = voice_tool
+        cfg["section_media"]["voice_max_duration"] = 10
+        plug = mod.DebouncePlugin(context, cfg)
+        _stt_called = False
+        async def _no_stt(*a, **k):
+            nonlocal _stt_called
+            _stt_called = True
+        plug.media_recognizer._transcribe_one = _no_stt
+        class _PathRecord(_FR):
+            async def to_path(self):
+                return self._temp_path
+        rec = _PathRecord(); rec.duration = 999
+        _tmp = Path(tempfile.mkdtemp(prefix="kira-long-voice-")) / "voice.mp3"
+        _tmp.write_bytes(b"fakeaudio")
+        rec._temp_path = str(_tmp)
+        message = make_msg(f"long-voice-{voice_tool}", "长语音", mentioned=False, chain=[rec])
+        event = SEvent(message, session(), mentioned=False)
+        await plug.handle_msg(event)
+        await plug.guard_official_vlm(event)
+        await plug.on_media_rec_im(event)
+        if plug.media_recognizer._stage1_pending:
+            await asyncio.gather(*list(plug.media_recognizer._stage1_pending.values()),
+                                 return_exceptions=True)
+        message.message_str = "".join(e.text for e in message.chain if hasattr(e, "text"))
+        batch_event = batch(message)
+        await plug.on_media_rec_batch(batch_event)
+        check(f"超长语音占位（语音工具={voice_tool}）",
+              "[长语音 999秒" in (message.message_str or "")
+              and "Record #" not in (message.message_str or ""), message.message_str)
+        check(f"超长语音路径（语音工具={voice_tool}）",
+              "file_path:" in (message.message_str or ""), message.message_str)
+        check(f"超长语音无 read_media ID（语音工具={voice_tool}）",
+              not (plug.media_recognizer.access._message_entries.get(id(message)) or []))
+        check(f"超长语音不触发 STT（语音工具={voice_tool}）", not _stt_called)
+        await shutdown(plug)
 
     # native 仅唤醒：工具开启时保留可读，关闭时占位
     context = Ctx({"bot_config.capabilities.image_recognition.mode": "native"})
