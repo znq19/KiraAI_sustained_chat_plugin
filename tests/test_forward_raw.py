@@ -304,6 +304,28 @@ async def run(plugin_dir: Path):
           "SnowLuma 卡片深层" in card_text, card_text)
     await manager.shutdown()
 
+    # ---------------- 3c2. card ids unusable -> get_msg(parent message_id) ----------------
+    bad_card = '<msg action="viewMultiMsg" m_resid="BAD" m_fileName="ALSO-BAD">聊天记录</msg>'
+    client = FakeClient({
+        "MSG-OUT": [{"sender": {"nickname": "A"}, "time": 1700000001,
+                     "message_id": "inner-msg", "message": [
+                         {"type": "xml", "data": {"data": bad_card}}]}],
+        "REAL-RES": [flat("B", 1700000002, "get_msg 回退深层")],
+    }, msg_payloads={
+        "inner-msg": {"sender": {"nickname": "A"}, "time": 1700000001,
+                      "message": [{"type": "forward", "data": {"id": "REAL-RES"}}]},
+    })
+    manager, _ = make_manager(module, client)
+    obj = message(MessageChain([Text("前缀")]), {"message": [
+        {"type": "forward", "data": {"id": "MSG-OUT"}}]})
+    manager.prepare_message(obj, SID)
+    await settle(manager)
+    root_fid = next((getattr(x, "_media_forward_id", None) for x in obj.chain
+                     if isinstance(x, Text) and getattr(x, "_media_forward_id", None)), None)
+    fallback_text = (await manager.read_forward(batch([obj]), root_fid, depth=-1)).text
+    check("卡片无有效 ID：get_msg 父消息回退", "get_msg 回退深层" in fallback_text, fallback_text)
+    await manager.shutdown()
+
     # ---------------- 3d. LightApp / JSON multimsg card ----------------
     card_json = json.dumps({
         "app": "com.tencent.multimsg",

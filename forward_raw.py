@@ -31,6 +31,7 @@ class RawForward:
     content: list | None = None    # inline node list for forward.data.content
     data: dict = field(default_factory=dict)
     index: int = -1
+    message_id: str = ""           # enclosing node message id, for get_msg fallback
 
 
 def first_str(*values) -> str:
