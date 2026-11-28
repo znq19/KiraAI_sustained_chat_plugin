@@ -650,7 +650,7 @@ class MediaAccessManager:
             return
         if record.get("hydrated"):
             return
-        if not (raw.id or raw.content or raw.kind in ("node", "xml")):
+        if not (raw.id or raw.content or raw.kind in ("node", "xml", "json")):
             return
         retry_after = record.get("retry_after") or 0
         if retry_after > time.time():
