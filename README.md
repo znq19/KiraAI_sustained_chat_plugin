@@ -1,4 +1,4 @@
-# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.5
+# KiraAI_sustained_chat_plugin/可持续聊天 v2.8.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_sustained_chat_plugin)
 
@@ -379,6 +379,12 @@ croniter>=1.3.0
 <details>
 <summary>更新日志</summary>
 
+### v2.8.6
+
+- **SnowLuma 嵌套卡片兜底**：XML/lightApp 卡片同时尝试 `m_resid`、`m_fileName`、`meta.detail.resid`；兼容 `&quot;`/JSON 转义；`get_forward_msg` 失败时按 `id`/`res_id` 参数回退。普通 XML/JSON 卡片仍原样保留，不误伤。
+- **回归**：新增 SnowLuma XML `m_resid` 失败回退 `m_fileName`、LightApp JSON `meta.detail.resid` 两个用例；S/Z 全量套件通过；真实 KiraAI 3.3/3.4 加载 10/10。
+- 版本 2.8.5 → 2.8.6
+
 ### v2.8.5
 
 - **深层合并转发补全（KiraAI 3.3.0 / 3.4.0 通用）**：现场日志 `read_forward(depth=2)` 返回「还可下钻0层」且嵌套内容消失。根因不在 3.3/3.4 的插件接口，而在框架 QQ 适配器：嵌套 `forward` 段用「内层消息的 message_id」再调 `get_forward_msg`（协议端要求记录 resId，NapCat 明确报「内层消息无法获取」），且完全不看 `forward.data.content` 与 NapCat 的 `{type:"node", data:{...}}` 包裹。2.8.0 起改为「保留原树 + read_forward 下钻」后，框架没建出的嵌套层就不会再被 `_flatten_forwards` 拍平，于是表现为升级后丢嵌套。
@@ -387,7 +393,6 @@ croniter>=1.3.0
 - **NapCat 兜底**：框架整体丢弃顶层 forward（node 包裹导致 `TypeError`）时，插件会补一条 `[Forward #…｜可用 read_forward(…) 查看]` 预览并生成可读取记录，不再整段消失。
 - **完整拉黑（all）独立配置 + 热更新**：`<ignore>all` / `manage_ignore(block_type=all)` 的默认时长、是否允许 bot 自设、最大时长改由独立 `section_ignore` 控制，不再回落到戳一戳配置；`HarassDetector.reload()` + 消息入口/标签/工具调用前读取当前插件配置，WebUI 改完无需重启，已有计数与屏蔽状态保留。
 - **按需媒体设置联动修复**：语音按需工具开启时，`voice_recognition_only_on_mention` / `voice_private_need_mention` 跳过的普通语音保留 Record 供 `read_media`；但 `voice_max_duration` 超限的长语音**始终占位 `[长语音 X秒]`**，不自动/按需 STT、不提供 read_media，后台落盘成功时占位附带 `file_path`。native 模式补上 `image_recognition_probability`，超限图片在图片工具开启时保留元素而不是直接换成占位；工具关闭时维持原占位行为。
-- **SnowLuma 嵌套卡片兜底**：XML/lightApp 卡片同时尝试 `m_resid`、`m_fileName`、`meta.detail.resid`；兼容 `&quot;`/JSON 转义；`get_forward_msg` 失败时按 `id`/`res_id` 参数回退。普通 XML/JSON 卡片仍原样保留，不误伤。
 - **回归**：新增 `tests/test_forward_raw.py`（32 项断言：内联 content、id 嵌套、部分解析续钻、LLOneBot content、NapCat 包裹、顶层 XML 卡片、SnowLuma XML/JSON 卡片回退、node 层、循环、深度、失败保留、嵌套媒体、重启恢复、XML 卡片、引用补全）；`test_media_access` 等全量套件通过；真实 KiraAI 3.3.0 / 3.4.0 加载 10/10，真实适配器端到端 SnowLuma/NapCat/LLOneBot 三种形态均可读到嵌套正文。 新增 `tests/test_ignore_all_config.py`（6 项：all 独立默认/钳制/热更新/单项隔离）；`test_media_tool_pipeline` 增加按需语音/超长语音/native 仅唤醒/概率/超限、长语音占位/路径/不可读共 16 项。
 - 版本 2.8.4 → 2.8.5
 
